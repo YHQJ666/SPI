@@ -28,6 +28,12 @@
 #include "IQmathLib.h"
 #include "dcac_cfg.h"
 
+// 故障码：main.c 根据下面两个标志算出来，OLED 用来显示
+//   硬件 Trip 已经删掉了，只剩这两个
+#define FAULT_NONE      (0U)
+#define FAULT_UV        (1U)        // 输入欠压（不锁存）
+#define FAULT_OC        (2U)        // 电感过流（锁存）
+
 // 欠压标志：1 = Vin < UV_Volts（不锁存，电压回来自动清）
 extern volatile Uint16 Protect_UvFault;
 // 过流标志：1 = |IL| > OC_Amps（锁存，要 Protect_Clear() 才清）
