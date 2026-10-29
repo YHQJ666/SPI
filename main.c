@@ -58,15 +58,11 @@ void Adc_Config(void);
 void Adc_ZeroCal(void);
 void Gpio_Config(void);
 __interrupt void ADC_ISR(void);
-#if (Protect_Enable == 1)
-__interrupt void Epwm1_TripIsr(void);
-#endif
 
-// 故障码
+// 故障码（纯软件保护，没有硬件 Trip 中断了）
 #define FAULT_NONE      (0U)
-#define FAULT_HW_OC     (1U)        // 硬件过流 Trip
-#define FAULT_SW_OC     (2U)        // 软件过流
-#define FAULT_OVERVOLT  (3U)        // 输出过压
+#define FAULT_UV        (1U)        // 输入欠压（不锁存）
+#define FAULT_OC        (2U)        // 电感过流（锁存）
 
 // 正弦表 -1 ~ +1，256 点，编译期转成 Q24 整数（_IQ() 是编译期常量折叠）
 // sin_table[i] = _IQ(sin(2*pi*i/256))
@@ -112,10 +108,11 @@ volatile _iq  Vout = 0;             // 输出电压 V
 volatile _iq  Iout = 0;             // 输出电流 A
 volatile _iq  IL   = 0;             // 电感电流 A（电流内环反馈）
 volatile _iq  Vref = 0;             // 电压给定 V
-volatile _iq  IRef = 0;             // 电流环给定 A
+volatile _iq  IRef = 0;             // 电流环给定 A（由 ISR 每拍算出，不要在这里写初值）
 volatile _iq  Mod  = 0;             // 瞬时调制比
 volatile Uint32 PhaseAcc = 0;       // 相位累加器：高 8 位查表下标，低 24 位 Q24 小数
 volatile _iq  RefRamp = 0;          // 软启动给定峰值
+volatile _iq  IRamp = 0;            // 电流环给定的软启动幅值（A），只给 LOOP_CURR_CLOSED 用
 
 // 输入侧两路采样：只存 ADC 原始码，不参与控制环，后续留给输入过压/过流保护。
 // 换算成工程量（加保护阈值时用）：
@@ -216,11 +213,28 @@ volatile _iq FiltIL   = 0;
 volatile _iq FiltMod  = 0;
 
 // 运行控制与故障
-volatile Uint16 Run_Enable = 0U;    // 1=允许运行（自动软启动），0=停机
+//===========================================================================
+// 运行使能
+// ★ 这里必须是 1U：全工程没有任何一处代码会把它写 1，
+//   它一旦是 0，RefRamp 永远停在 0 -> Vref=0 -> IRef=0 -> 调制比恒 0，
+//   表现就是"给定设了 4.16A，输出却只有死区那零点几伏"。
+//   （17e5f6e "修改中文注释格式" 那次提交把它从 1U 改成了 0U）
+//===========================================================================
+volatile Uint16 Run_Enable = 1U;    // 1=允许运行（自动软启动），0=停机
 volatile Uint16 FaultClear = 0U;    // 置 1 清除故障锁存
 volatile Uint16 FaultLatch = FAULT_NONE;
-volatile Uint16 OcCnt = 0U;         // 软件过流去抖计数
 volatile Uint16 IsrCnt = 0U;        // 中断次数，调试观察用
+
+//===========================================================================
+// 中断耗时测量：用 CpuTimer0 自由运行当时间戳，不用示波器
+//   1 个计数 = 16.67 ns（60MHz）；20kHz 中断周期 = 3000 个计数 = 50us
+//   换算：时间(us) = 计数值 / 60
+//===========================================================================
+volatile Uint32 IsrT0        = 0UL; // 本次中断入口的时间戳
+volatile Uint32 IsrTLast     = 0UL; // 上一次中断入口的时间戳
+volatile Uint32 IsrCycles    = 0UL; // 本次中断执行耗时（计数）
+volatile Uint32 IsrCyclesMax = 0UL; // 历史最大耗时（计数）← 峰值最有用
+volatile Uint32 IsrPeriod    = 0UL; // 两次中断的间隔（计数，应恒为 3000）
 
 #if (Debug_Float_View == 1)
 //===========================================================================
@@ -370,24 +384,21 @@ static void Oled_F(Uint16 x, Uint16 y, float v, Uint16 ints, Uint16 decs)
 static void Oled_Task(void)
 {
     // 第 0 行：保护状态 + 开环/闭环（两个都很短，合在一行）
-    //   S:OK  L:CL   ->  保护正常、闭环
-    //   S:OK  L:OP   ->  保护正常、开环
-    //   S:HW-OC / S:SW-OC / S:OV   ->  硬件过流 / 软件过流 / 过压
-    if (FaultLatch == FAULT_NONE)
+    //   S:OK  L:CLOSE  ->  保护正常、闭环
+    //   S:OK  L:OPEN   ->  保护正常、开环
+    //   S:UV           ->  输入欠压（不锁存，电压回来自动消失）
+    //   S:OC           ->  电感过流（锁存，要 FaultClear）
+    if (FaultLatch == FAULT_OC)
     {
-        OLED_ShowString(0U, 0U, (u8 *)"S:OK ");
+        OLED_ShowString(0U, 0U, (u8 *)"S:OC ");
     }
-    else if (FaultLatch == FAULT_HW_OC)
+    else if (FaultLatch == FAULT_UV)
     {
-        OLED_ShowString(0U, 0U, (u8 *)"S:HW ");
-    }
-    else if (FaultLatch == FAULT_SW_OC)
-    {
-        OLED_ShowString(0U, 0U, (u8 *)"S:SW ");
+        OLED_ShowString(0U, 0U, (u8 *)"S:UV ");
     }
     else
     {
-        OLED_ShowString(0U, 0U, (u8 *)"S:OV ");
+        OLED_ShowString(0U, 0U, (u8 *)"S:OK ");
     }
 
 #if (LOOP_MODE != LOOP_SINE_OPEN)
@@ -588,7 +599,9 @@ static void Sfra_Tick(void)
 // 主函数入口
 //===========================================================================
 void main(void){
-    Uint16 faultHandled = 0U;
+#if (Protect_Enable == 1)
+    Uint16 faultHandled = 0U;       // 只有保护打开时才用它做"只封波一次"的判定
+#endif
 
     // 系统初始化（时钟、看门狗、外设时钟）
     InitSysCtrl();
@@ -639,28 +652,24 @@ void main(void){
     SFRA_Init();
 #endif
 
-#if (Protect_Enable == 1)
-    // 过流保护先建立，再开中断
-    Protect_InitOCP();
-#endif
+    // 保护：只配 TZ 的软件封波通路，不碰 COMP/Digital Compare
+    // ★ 无条件调用：TZCTL 复位值是"强制输出高"，不配的话软件封波会把四管拉高
+    Protect_Init();
 
-    // 中断向量绑定
-    // 注意：TZ 中断的向量绑定和下面的 PIE 使能必须成对出现，
-    // 只开使能不绑向量的话，一旦 TZ 触发会跳进 TI 默认 ISR 里
-    // 那句 __asm("ESTOP0"); for(;;); ，CPU 直接卡死
+    // 中断向量绑定（只有 ADCINT1；TZ 中断已经不用了）
     EALLOW;
     PieVectTable.ADCINT1     = &ADC_ISR;            // ADC 中断：控制环
-#if (Protect_Enable == 1)
-    PieVectTable.EPWM1_TZINT = &Epwm1_TripIsr;      // 硬件过流
-#endif
     EDIS;
 
     // 初始化 PR：电压外环，准谐振 w0 = 314.159, wc = 10
     // r = w0*Ts/2、q = wc*Ts/2 已经在 dcac_cfg.h 里按编译期常量算成 Q24
     // （w0 = 314 超出 Q24 的动态范围，所以在设计期就折进 r、q，不进运行期），
     // 因此初始化阶段也全是定点运算
+    // ★ 电流单环不需要 PR，pr.c 里整个函数都编掉了，这里也要跟着不调用
+#if (LOOP_MODE != LOOP_CURR_CLOSED)
     PR_Design(&PR_V, KP_V, KR_V,
               R_V, Q_V);
+#endif
     PR_V.Ref = 0;
     PR_V.Fdb = 0;
     PR_V.X1 = 0; PR_V.X2 = 0;
@@ -682,17 +691,23 @@ void main(void){
     PI_I.OutMin = -Mod_Max;
     PI_I.OutMax =  Mod_Max;
 
-    // 开 PIE 和 CPU 中断
+    // ---- CpuTimer0 配成自由运行的周期计数器，给 ADC_ISR 量耗时 ----
+    //   PRD 拉满 -> 从 0xFFFFFFFF 往下数，60MHz 下 71.6s 才绕回，够用
+    //   TSS=1 先停，写 TRB=1 把计数器重装成 PRD，再 TSS=0 放它跑
+    //   注意：TIM 是"往下数"的，所以耗时 = 入口时间戳 - 当前时间戳
+    CpuTimer0Regs.TCR.bit.TSS = 1;              // 先停
+    CpuTimer0Regs.TPR.all     = 0;              // 不分频（1 计数 = 1 个 SYSCLKOUT）
+    CpuTimer0Regs.TPRH.all    = 0;
+    CpuTimer0Regs.PRD.all     = 0xFFFFFFFFUL;   // 周期拉满 = 自由运行
+    CpuTimer0Regs.TCR.bit.TRB = 1;              // 计数器重装
+    CpuTimer0Regs.TCR.bit.TSS = 0;              // 启动
+
+    // 开 PIE 和 CPU 中断（只有 ADCINT1 一路；TZ 中断已经不用了）
     EALLOW;
     PieCtrlRegs.PIEIER1.bit.INTx1 = 1;      // ADCINT1
     IER |= M_INT1;
-#if (Protect_Enable == 1)
-    PieCtrlRegs.PIEIER2.bit.INTx1 = 1;      // EPWM1_TZINT
-    IER |= M_INT2;
-#else
-    PieCtrlRegs.PIEIER2.bit.INTx1 = 0;      // 保护关闭，TZ 中断也不能开
+    PieCtrlRegs.PIEIER2.bit.INTx1 = 0;
     IER &= (Uint16)(~M_INT2);
-#endif
     EDIS;
 
     EINT;
@@ -751,14 +766,18 @@ void main(void){
         // 外部（尤其在保护锁存时）把它清 0，会让库停在中途而 FreqIndex 还能涨。
 #endif
 
-        if (FaultLatch != FAULT_NONE)
+#if (Protect_Enable == 1)
+        // 过流锁存才真正封波；欠压不停机（切兜底），所以这里只认 OC。
+        // Protect_Enable = 0 时这段不编译 —— Protect_ForceStop() 本身是无条件生效的
+        // 主动急停，不在这里挡住的话，只置标志也会把桥臂关掉
+        if (FaultLatch == FAULT_OC)
         {
-            // 故障：硬件封锁一次，输出留在中点
             if (faultHandled == 0U)
             {
                 faultHandled = 1U;
                 Protect_ForceStop();
                 RefRamp = 0;
+                IRamp   = 0;
                 PhaseAcc = 0U;
             }
         }
@@ -766,21 +785,24 @@ void main(void){
         {
             faultHandled = 0U;
         }
+#endif
 
         // 复位故障：把 FaultClear 置 1（调试器或以后加的通信）
         if (FaultClear != 0U)
         {
             FaultClear = 0U;
-            Protect_ClearTrip();
+            Protect_Clear();            // 清过流锁存 + 清 TZ 触发
             FaultLatch = FAULT_NONE;
-            OcCnt = 0U;
+#if (Protect_Enable == 1)
             faultHandled = 0U;
+#endif
 
             // 清两个环的历史，重新软启动
             PR_V.X1 = 0; PR_V.X2 = 0;
             PR_V.Y1 = 0; PR_V.Y2 = 0;
             PI_I.Integral = 0;
             RefRamp = 0;
+            IRamp   = 0;
             PhaseAcc = 0U;
         }
 
@@ -876,7 +898,14 @@ __interrupt void ADC_ISR(void)
 {
     _iq sin_val;
 
-    GpioDataRegs.GPASET.bit.GPIO4 = 1;      // 中断计时脚拉高
+    // ---- 0. 时间戳：量中断耗时（不用示波器）----
+    //   TIM 往下计数，耗时 = 入口时间戳 - 出口时间戳
+    //   IsrPeriod 应恒等于 3000（3000/60MHz = 50us），对不上就说明中断不是 20kHz
+    IsrT0     = CpuTimer0Regs.TIM.all;
+    IsrPeriod = IsrTLast - IsrT0;
+    IsrTLast  = IsrT0;
+
+    GpioDataRegs.GPASET.bit.GPIO5 = 1;      // 中断计时脚拉高
 
     // ---- 1. 采样并换算工程量 ----
     // 固定槽位：SOCn 的结果就在 ADCRESULTn 里，直接按下标取，不做任何判断
@@ -968,47 +997,33 @@ __interrupt void ADC_ISR(void)
 
 #else
 
-#if (Protect_Enable == 1)
-    // ---- 2. 保护判断，越限就锁存 ----
-    // 阈值都是 Q24，定点比较就是整数比较，不需要任何转换
-    if (Vout > OV_Volts)
-    {
-        FaultLatch = FAULT_OVERVOLT;
-    }
+    // ---- 2. 软件保护判断（欠压 UV + 电感过流 OC）----
+    // Protect_Enable = 0 时照样算、照样置标志，但下面不停机也不封波，
+    // 方便先在 Expressions 里看 UvFault/OcFault 真不真，再决定要不要打开
+    Protect_Update(Vin, IL);
 
-    if ((IL > OC_Amps) || (IL < -OC_Amps))
+    if (Protect_OcFault != 0U)
     {
-        OcCnt++;
-        if (OcCnt >= OC_Debounce)
-        {
-            FaultLatch = FAULT_SW_OC;
-        }
+        FaultLatch = FAULT_OC;          // 锁存：要 FaultClear 才清
+    }
+    else if (Protect_UvFault != 0U)
+    {
+        FaultLatch = FAULT_UV;          // 不锁存：电压回来自动清
     }
     else
     {
-        OcCnt = 0U;
+        FaultLatch = FAULT_NONE;
     }
 
-    if (Protect_TripFlag != 0U)
-    {
-        FaultLatch = FAULT_HW_OC;
-    }
-#else
-    // Protect_Enable = 0：软件保护也一并关掉。
-    // 这一点很关键：ADCINA2 没接（或电流传感器没上电）时采样恒为 0，
-    // 算出来 IL = -30A，按 25A 阈值会立刻误报过流，输出被钉在中点，
-    // 表现出来就是"没有 SPWM 输出"
-    FaultLatch = FAULT_NONE;
-    OcCnt = 0U;
-#endif
-
-    if (FaultLatch != FAULT_NONE)
+    // 只有过流（且保护已打开）才停机；欠压是切兜底，不是停机
+    if ((Protect_Enable == 1U) && (FaultLatch == FAULT_OC))
     {
         // 故障：清历史、输出中点
         PR_V.X1 = 0; PR_V.X2 = 0;
         PR_V.Y1 = 0; PR_V.Y2 = 0;
         PI_I.Integral = 0;
         RefRamp = 0;
+        IRamp   = 0;
         Mod = 0;
         SPWM_SetNeutral();
     }
@@ -1069,8 +1084,36 @@ __interrupt void ADC_ISR(void)
 #if (SFRA_ENABLE == 1)
         IRef = SFRA_INJ(Vref);
 #else
-        IRef = Vref;
+        // ★ 电流给定 = 安培，不是电压环的 Vref（伏特）。
+        //   Vref = sin_val*RefRamp，幅值会爬到 Vref_Peak = 50.91，
+        //   直接当电流给定就是 50.9A，PI 一拍就顶到 ±Mod_Max。
+        //   这里用电流环自己的软启动幅值 IRamp（0 -> Iref_Peak），
+        //   Iref_Peak = sqrt(2)*4.16 = 5.883A（4.16Arms/50Hz）。
+        if (Run_Enable != 0U)
+        {
+            IRamp += Iref_Ref_Step;
+            if (IRamp > Iref_Peak)
+            {
+                IRamp = Iref_Peak;
+            }
+        }
+        else
+        {
+            IRamp = 0;
+        }
+
+        IRef = _IQmpy(sin_val, IRamp);      // 50Hz 正弦电流给定（幅值 IRamp）
 #endif
+        // 给定限幅：Iref_Max（8A）原来只在 dcac_cfg.h 里定义、从没被用过
+        if (IRef > Iref_Max)
+        {
+            IRef = Iref_Max;
+        }
+        else if (IRef < -Iref_Max)
+        {
+            IRef = -Iref_Max;
+        }
+
         PI_I.Ref = IRef;
         PI_I.Fdb = IL;
         Mod = PI_Calc(&PI_I);
@@ -1152,7 +1195,20 @@ __interrupt void ADC_ISR(void)
     AdcRegs.ADCINTOVFCLR.all = 0x0001;
     PieCtrlRegs.PIEACK.all = PIEACK_GROUP1;
 
-    GpioDataRegs.GPACLEAR.bit.GPIO4 = 1;    // 中断计时脚拉低
+    // ---- 9. 中断耗时（CPU 周期数，60MHz 下 1 计数 = 16.67ns）----
+    //   IsrCycles    = 本次耗时      -> 时间(us) = IsrCycles / 60
+    //   IsrCyclesMax = 历史峰值      <- 看最坏情况用这个
+    {
+        Uint32 dt = IsrT0 - CpuTimer0Regs.TIM.all;
+
+        IsrCycles = dt;
+        if (dt > IsrCyclesMax)
+        {
+            IsrCyclesMax = dt;
+        }
+    }
+
+    GpioDataRegs.GPACLEAR.bit.GPIO5 = 1;    // 中断计时脚拉低
 }
 
 //===========================================================================
@@ -1386,52 +1442,17 @@ void Adc_Config(void)
 
 //===========================================================================
 // GPIO 配置函数
-//   GPIO4 中断计时脚，普通 GPIO 输出，初值低
-//   spwm.c 只占用 GPIO0~GPIO3，所以 GPIO4 可以自由使用
+//   GPIO5 中断计时脚，普通 GPIO 输出，初值低
+//   spwm.c 只占用 GPIO0~GPIO3，所以 GPIO5 可以自由使用
+//   （原来用 GPIO4，实测那个脚看不到脉冲，换到 GPIO5）
 //===========================================================================
 void Gpio_Config(void)
 {
     EALLOW;
-    GpioCtrlRegs.GPAMUX1.bit.GPIO4 = 0;         // 复用为普通 GPIO
-    GpioCtrlRegs.GPADIR.bit.GPIO4  = 1;         // 输出
+    GpioCtrlRegs.GPAMUX1.bit.GPIO5 = 0;         // 复用为普通 GPIO
+    GpioCtrlRegs.GPADIR.bit.GPIO5  = 1;         // 输出
     EDIS;
 
-    GpioDataRegs.GPACLEAR.bit.GPIO4 = 1;        // 初值低
+    GpioDataRegs.GPACLEAR.bit.GPIO5 = 1;        // 初值低
 }
 
-//===========================================================================
-// 硬件过流 Trip 中断
-//   TZ 已经把四管拉低，这里只做：置标志、故障锁存、关 TZ 中断源、清中断标志
-//   OST/CBC 触发源保持锁存，必须软件 Protect_ClearTrip() 才能恢复输出
-//   关掉 TZEINT 是为了防止故障一直存在导致每个载波周期都进中断
-//   Protect_Enable = 0 时整个函数不编译
-//===========================================================================
-#if (Protect_Enable == 1)
-__interrupt void Epwm1_TripIsr(void)
-{
-    Protect_TripFlag = 1U;
-
-    if (EPwm1Regs.TZFLG.bit.OST != 0U)
-    {
-        Protect_TripSource = 1U;        // DCxEVT1 单次，正向过流
-    }
-    else if (EPwm1Regs.TZFLG.bit.CBC != 0U)
-    {
-        Protect_TripSource = 2U;        // DCxEVT2 逐周期，反向过流
-    }
-    else
-    {
-        Protect_TripSource = 0U;
-    }
-
-    FaultLatch = FAULT_HW_OC;
-
-    EALLOW;
-    EPwm1Regs.TZEINT.bit.OST = 0;       // 先关中断源，避免中断风暴
-    EPwm1Regs.TZEINT.bit.CBC = 0;
-    EPwm1Regs.TZCLR.bit.INT  = 1;       // 只清中断标志，OST/CBC 保持锁存
-    EDIS;
-
-    PieCtrlRegs.PIEACK.all = PIEACK_GROUP2;
-}
-#endif

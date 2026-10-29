@@ -47,29 +47,66 @@
 
 #include "DSP28x_Project.h"
 
-// ---- 1. 环路模式 ----
-// 统一成一个 LOOP_MODE，取代原来的 Loop_Open/Loop_Closed/Loop_Mode。
-// 编号 0~3 与 Boost_SFRA 一致；4 是 SFRA 测受控体专用的固定占空比开环。
-// ★ 0 和 4 必须分开：0 是"正弦 + 软启动"的现状行为，4 是直流固定占空比。
-#define LOOP_SINE_OPEN    0   /* 正弦开环 + 软启动（改动前的现状） */
-#define LOOP_VOLT_CLOSED  1   /* 电压单环 */
-#define LOOP_CURR_CLOSED  2   /* 电流单环 */
-#define LOOP_DUAL         3   /* 电压 + 电流双环 */
-#define LOOP_FIXED_DUTY   4   /* 固定占空比开环（SFRA 测受控体用） */
+//===========================================================================
+//                         ★★★ 常 改 区 ★★★
+//  平时要动的基本只有这一段。下面的内容是标定、中断、RMS 之类的实现细节，
+//  改之前先翻到对应小节看注释。
+//===========================================================================
 
+// ---- 环路模式 ----
+// 0 正弦开环 + 软启动 / 1 电压单环 / 2 电流单环 / 3 电压+电流双环 / 4 固定占空比开环
 // 允许 build configuration 用 -dLOOP_MODE=n 覆盖（必须 #ifndef 包住，否则头文件赢）
+#define LOOP_SINE_OPEN    0
+#define LOOP_VOLT_CLOSED  1
+#define LOOP_CURR_CLOSED  2
+#define LOOP_DUAL         3
+#define LOOP_FIXED_DUTY   4
 #ifndef LOOP_MODE
-#define LOOP_MODE         4
+#define LOOP_MODE         2
 #endif
 
-// ---- 1b. 功能开关：SFRA 扫频版 / OLED 版 二选一 ----
-//   0 = OLED 版（现状）：OLED 显示 + 双通道示波器（RAM 运行）
-//   1 = SFRA 版：SFRA 扫频 + 上位机 SCI（必须配 28035_FLASH_lnk.cmd 从 Flash 运行）
-//   ★ 两者的 SCI/OLED 抢同一对引脚 GPIO28/29，且 SFRA 代码只有在 Flash 里才放得下
-//   ★ 切换方法：改这个 0/1，再到 CCS 工程属性里把链接脚本换成 28035_FLASH_lnk.cmd
+// ---- 功能开关 ----
+// SFRA_ENABLE: 0 = OLED 版（OLED + 示波器缓冲）；1 = SFRA 扫频版（无 OLED）
+//   ★ 两者抢 GPIO28/29 的 SCI 引脚，且 SFRA 库只有 Flash 里放得下
+// DEBUG_VIEW_ENABLE: 1 = 额外编译 Debug_View 的镜像字段和示波器缓冲；
+//   0 = 只留 OLED 要用的那几个有效值。中断里两条路都只有一次函数调用/空调用
 #ifndef SFRA_ENABLE
-#define SFRA_ENABLE       1
+#define SFRA_ENABLE       0
 #endif
+#ifndef DEBUG_VIEW_ENABLE
+#define DEBUG_VIEW_ENABLE 0
+#endif
+
+// ---- 电流环 PI（LOOP_CURR_CLOSED）----
+// ★ 量纲随 Task 5（前馈）一起改：现在 PI 输出直接当调制比，所以是 mod/A；
+//   加上前馈之后 PI 输出变成"电压"，这一对要改成 9.6 V/A / 11.46（× Vbus 60V）。
+// Ki = 0 就是纯 P：被控对象是 1/(sL)，纯 P 在 50Hz 处 Kp/(wL) 已经足够大
+#define KP_I                _IQ(0.16f)    // [mod/A]  -> 前馈后改 [V/A]
+#define KI_I                0.0f          // [1/s]，0 = 纯 P
+
+// ---- 双环 PI（LOOP_DUAL）----
+// 双环那条路的 PI 输出直接当调制比用，量纲还是 mod/A，所以要单独一套，
+// 不能和上面的 V/A 混用（混了会把双环增益静默放大 60 倍）
+#define KP_I3               _IQ(0.16f)    // [mod/A]
+#define KI_I3               0.0f
+
+// ---- 保护 ----
+// 纯软件判断，硬件保护（COMP/DAC/Digital Compare）已经删掉
+#define UV_Volts_F          55.0f         // 输入欠压阈值 V
+#define OC_Amps_F           12.0f         // 电感过流阈值 A（瞬时峰值）
+#define UV_Debounce         200U          // 欠压去抖拍数（200 拍 @20kHz = 10ms）
+#define OC_Debounce         3U            // 过流去抖拍数
+// 0 = 只判断、只置标志，不影响输出（当前）
+// 1 = 欠压切固定 0.85 正弦兜底，过流封波锁存
+#ifndef Protect_Enable
+#define Protect_Enable      0
+#endif
+
+//===========================================================================
+//                        常改区到此为止
+//===========================================================================
+
+// ---- 1. 环路模式 / 功能开关：定义已移到上面的常改区 ----
 
 // ---- 上位机 SFRA GUI（SCI-A 通讯）开关 ----
 //   0 = 不接上位机：不初始化 SCI-A、不建映射表、中断里不服务协议。
@@ -360,45 +397,51 @@
 
 #define KP_V            _IQ(0.0518f)    // 电压环比例
 #define KR_V            _IQ(0.0823f)    // 电压环谐振增益
-#define KP_I            _IQ(0.6161f)    // 电流环 Kp [mod/A]
 
-// 电流环 Ki，单位 1/s，0 = 纯 P
-#define KI_I            0.0f
+// KP_I / KI_I / KP_I3 / KI_I3 的定义在顶部常改区。
+// 注意量纲：KP_I/KI_I 是 mode 2（前馈结构）用的 V/A，KP_I3/KI_I3 是 mode 3 用的 mod/A。
 // 积分增益把采样周期折进去：KI_I_Ts = KI_I*Ts，中断里只乘一次。
 // 这样做一是快，二是保精度：Ts = 50us 在 Q24 里只有 838 个刻度
 // （0.1% 量化误差），先乘 Ts 会把误差的有效位数吃掉十几位。
 // 折进来以后 KI_I_Ts = KI_I*50us，量级很小，Q24 的 6e-8 分辨率完全够用
-#define KI_I_Ts         _IQ(KI_I * Ts_S)
+#define KI_I_Ts         _IQ(KI_I  * Ts_S)
+#define KI_I3_Ts        _IQ(KI_I3 * Ts_S)
 
 #define Iref_Max_F      8.0f            // 电容电流给定限幅 A
 #define Iref_Max        _IQ(Iref_Max_F)
 
 // ---- 7. 保护总开关 ----
-// 0 = 全部关闭：硬件 Trip（COMP + Digital Compare）完全不配置，
-//     软件过流/过压判断也不执行，FaultLatch 恒为 NONE。
-// 1 = 全部打开：整机运行时用
-//
-// ★ 当前设为 0：排查 SFRA 扫频中途断线时，先把保护全部摘掉，
-//   排除「保护误动作 -> 停机 -> 上位机认为掉线」这条路径。
-//   ★★ 这个配置下没有任何过压/过流保护，调试完必须改回 1 ★★
-#ifndef Protect_Enable
-#define Protect_Enable  0
-#endif
+// Protect_Enable 的定义在顶部常改区。
+// 硬件保护（COMP1/COMP2 + 内部 DAC + Digital Compare + TZ 中断）已整体删除，
+// 板上没有比较器通路。现在只有 protect.c 里的两条软件判断：
+//   欠压 Vin < UV_Volts、过流 |IL| > OC_Amps
 
-// ---- 8. 保护阈值与软启动 ----
-#define OV_Volts_F      45.0f           // 输出过压阈值 V（峰值）
-#define OV_Volts        _IQ(OV_Volts_F)
-// 软件过流阈值按电感电流算，要高于硬件 Trip 值（默认 20A）
-// 前提是 ADCINA2 真的接了电感电流传感器；没接时采样恒为 0，
-// 算出来 IL = -30A 会立刻误报过流，所以调试期必须把 Protect_Enable 置 0
-#define OC_Amps_F       25.0f
+// ---- 8. 保护阈值（Q24 化）与软启动 ----
+// UV_Volts_F / OC_Amps_F / UV_Debounce / OC_Debounce 在顶部常改区
+#define UV_Volts        _IQ(UV_Volts_F)
 #define OC_Amps         _IQ(OC_Amps_F)
-#define OC_Debounce     3U              // 过流连续几个采样点才认
 #define Soft_Start_Ms   500U            // 软启动时长 ms
 // 每个中断周期给定增量 = 额定峰值 / (软启动时间 * 中断频率)
 #define Soft_Start_Step_F \
     (Vref_Peak_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
 #define Soft_Start_Step _IQ(Soft_Start_Step_F)      // Q24：5.0912e-3 -> 85415
+
+// ---- 8b. 电流单环（LOOP_CURR_CLOSED）给定 ----
+// ★ 单电流环没有电压环兜底，给定必须是"安培"，不能再用电压环的 Vref：
+//   Vref = sin*RefRamp 的幅值会爬到 Vref_Peak = 50.91，
+//   直接当电流给定就是 50.9A，PI 一拍就顶到 ±Mod_Max，
+//   四管打满、电流失控（Protect_Enable=0 时没有任何保护）。
+// ★ 所以电流给定有自己的软启动斜坡 IRamp，从 0 爬到 Iref_Peak。
+//
+// 给定形式：50Hz 正弦，有效值 4.16A
+//   峰值 = sqrt(2)*4.16 = 5.883A，Q24 的动态范围 ±128 装得下
+#define Iref_Rms_F          4.16f
+#define Iref_Peak_F         (1.41421356f * Iref_Rms_F)   // 5.883A 峰值
+#define Iref_Peak           _IQ(Iref_Peak_F)
+// 每个中断周期给定幅值的增量：和电压环共用 Soft_Start_Ms 这个软启动时长
+#define Iref_Ref_Step_F \
+    (Iref_Peak_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
+#define Iref_Ref_Step       _IQ(Iref_Ref_Step_F)        // Q24：5.883e-4 -> 9870
 
 // ---- 9. 中断计时脚 ----
 // GPIO4 配成普通 GPIO 输出，进 ADC 中断拉高、退出前拉低

@@ -1,309 +1,142 @@
 /*
  * protect.c
  *
- * 过流保护实现：COMP1/COMP2 + ePWM Digital Compare + Trip Zone
+ * 纯软件保护实现（欠压 + 过流），详见 protect.h 的说明。
  *
- * 设计要点：
- *   1) 四管全关是 TZCTL 直接把 EPWMxA / EPWMxB 拉低，与 CMPA 无关，
- *      所以控制环还在算也拦不住保护动作
- *   2) DCxEVT1 -> 单次触发(OST)，锁存，必须软件清 TZCLR 才能恢复
- *      DCxEVT2 -> 逐周期(CBC)，作为反向过流的即时限流
- *   3) TZEINT 只在 EPWM1 上开中断，用一路 ISR 上报即可
- *      （两个模块由同一对比较器驱动，必然同时动作）
- *   4) COMP1A 固定在 ADCINA2，本工程 ADCINA2 = 电感电流，
- *      所以阈值按电感电流传感器的量程换算
- *
- * 定点化：阈值换算全过程 Q24，只有最后乘 1024 转 DAC 码时用移位，
- *         因为 1024 超过 Q24 能表示的 ±128
+ * 本文件完全不碰 COMP1Regs / Comp2Regs / TZDCSEL / DCACTL / DCBCTL：
+ * 板上没有比较器通路，Digital Compare 的事件源一律不使能。
  */
 
 #include "protect.h"
 #include "dcac_cfg.h"
 
-volatile Uint16 Protect_TripFlag   = 0U;
-volatile Uint16 Protect_TripSource = 0U;
-
-// COMP 比较器 DAC：参考电压 3.3V、10 位，码值 = Vpin/3.3*1024
-#define DAC_Full_Scale_F    3.3f
-#define DAC_Max_Code        1023U
-// 电感电流调理（和 ADCINA2 同一路）：Vpin = 2.5 + 1mΩ*20*I = 2.5 + 0.02*I
-#define Sense_Offset_F      2.5f       // 双向电流采样零点 V
-#define Sense_Gain_F        0.02f      // 1mΩ * 20 = 0.02 V/A
-
-#define DAC_Full_Scale      _IQ(DAC_Full_Scale_F)
-#define Sense_Offset        _IQ(Sense_Offset_F)
-#define Sense_Gain          _IQ(Sense_Gain_F)
-
-// Q24 比例 -> 10 位 DAC 码：乘 1024 = 左移 10 位，反过来就是右移 24-10 = 14 位。
-// 写成移位而不是 _IQmpy，是因为 1024 超出 Q24 的动态范围（±128），不能再当 Q24 数用
-#define Ratio_To_Code(r)    ((long)((r) >> 14))
+volatile Uint16 Protect_UvFault = 0U;
+volatile Uint16 Protect_OcFault = 0U;
+volatile Uint16 Protect_UvCnt   = 0U;
+volatile Uint16 Protect_OcCnt   = 0U;
 
 /*===========================================================================
- * 函数名：Protect_AmpsToDacCode
- * 说明：把电感电流安培值换算成 COMP DAC 码
- *       Vpin(I) = 2.5 + 0.02*I
- *       code    = Vpin / 3.3 * 1024
- *       amps 为 Q24，乘增益加零点即可，不需要除法
+ * 函数名：Protect_ConfigTz
+ * 说明：把一个 ePWM 模块的触发区配成"只能软件触发、触发即四管全关"
+ *       TZCTL 复位值是 0xFFFF（强制输出高），必须显式写成 force-low
  *===========================================================================*/
-static Uint16 Protect_AmpsToDacCode(_iq amps)
+static void Protect_ConfigTz(volatile struct EPWM_REGS *epwm)
 {
-    _iq v;
-    long code;
-
-    // Vpin = 2.5 + 0.02*I
-    v = Sense_Offset + _IQmpy(amps, Sense_Gain);
-
-    if (v < 0)
-    {
-        v = 0;
-    }
-    else if (v > DAC_Full_Scale)
-    {
-        v = DAC_Full_Scale;
-    }
-
-    // code = v/3.3*1024
-    code = Ratio_To_Code(_IQdiv(v, DAC_Full_Scale));
-
-    if (code > (long)DAC_Max_Code)
-    {
-        code = (long)DAC_Max_Code;
-    }
-
-    return (Uint16)code;
-}
-
-/*===========================================================================
- * 函数名：Protect_ConfigEpwmTrip
- * 说明：给一个 ePWM 模块挂上数字比较加触发区
- *       正向过流: COMP1OUT -> DCAH/DCBH -> DCAEVT1/DCBEVT1 单次
- *       反向过流: COMP2OUT -> DCAL/DCBL -> DCAEVT2/DCBEVT2 逐周期
- *===========================================================================*/
-static void Protect_ConfigEpwmTrip(volatile struct EPWM_REGS *epwm)
-{
-    // 数字比较输入选择
-    epwm->DCTRIPSEL.bit.DCAHCOMPSEL = DC_COMP1OUT;
-    epwm->DCTRIPSEL.bit.DCBHCOMPSEL = DC_COMP1OUT;
-#if (Use_Comp2_Negative == 1)
-    epwm->DCTRIPSEL.bit.DCALCOMPSEL = DC_COMP2OUT;
-    epwm->DCTRIPSEL.bit.DCBLCOMPSEL = DC_COMP2OUT;
-#else
-    epwm->DCTRIPSEL.bit.DCALCOMPSEL = DC_TZ2;
-    epwm->DCTRIPSEL.bit.DCBLCOMPSEL = DC_TZ2;
-#endif
-
-    // DCAEVT1 / DCBEVT1：COMP1 输出高 = 正向过流
-    epwm->TZDCSEL.bit.DCAEVT1 = TZ_DCAH_HI;
-    epwm->DCACTL.bit.EVT1SRCSEL     = DC_EVT1;          // 不经过滤波
-    epwm->DCACTL.bit.EVT1FRCSYNCSEL = DC_EVT_ASYNC;     // 异步通道，响应最快
-
-    epwm->TZDCSEL.bit.DCBEVT1 = TZ_DCBH_HI;
-    epwm->DCBCTL.bit.EVT1SRCSEL     = DC_EVT1;
-    epwm->DCBCTL.bit.EVT1FRCSYNCSEL = DC_EVT_ASYNC;
-
-    // DCAEVT2 / DCBEVT2：COMP2 输出高 = 反向过流
-#if (Use_Comp2_Negative == 1)
-    epwm->TZDCSEL.bit.DCAEVT2 = TZ_DCAL_HI;
-    epwm->TZDCSEL.bit.DCBEVT2 = TZ_DCBL_HI;
-#else
-    epwm->TZDCSEL.bit.DCAEVT2 = TZ_EVT_DISABLE;
-    epwm->TZDCSEL.bit.DCBEVT2 = TZ_EVT_DISABLE;
-#endif
-    epwm->DCACTL.bit.EVT2SRCSEL     = DC_EVT2;
-    epwm->DCACTL.bit.EVT2FRCSYNCSEL = DC_EVT_ASYNC;
-    epwm->DCBCTL.bit.EVT2SRCSEL     = DC_EVT2;
-    epwm->DCBCTL.bit.EVT2FRCSYNCSEL = DC_EVT_ASYNC;
-
-    // 选为触发源
-    epwm->TZSEL.bit.DCAEVT1 = 1U;       // 单次(锁存)
-    epwm->TZSEL.bit.DCBEVT1 = 1U;
-#if (Use_Comp2_Negative == 1)
-    epwm->TZSEL.bit.DCAEVT2 = 1U;       // 逐周期(限流)
-    epwm->TZSEL.bit.DCBEVT2 = 1U;
-#else
-    epwm->TZSEL.bit.DCAEVT2 = 0U;
-    epwm->TZSEL.bit.DCBEVT2 = 0U;
-#endif
-
-    // 动作：四管全关（A/B 都直接拉低）
+    // A/B 输出在单次/逐周期触发时都拉低
+    epwm->TZCTL.bit.TZA = TZ_FORCE_LO;
+    epwm->TZCTL.bit.TZB = TZ_FORCE_LO;
+    // Digital Compare 的四个事件通道也一并拉低（虽然本工程不产生它们）
     epwm->TZCTL.bit.DCAEVT1 = TZ_FORCE_LO;
     epwm->TZCTL.bit.DCAEVT2 = TZ_FORCE_LO;
     epwm->TZCTL.bit.DCBEVT1 = TZ_FORCE_LO;
     epwm->TZCTL.bit.DCBEVT2 = TZ_FORCE_LO;
 
-    // 清标志（TZFLG 只读，用 TZCLR 清）
+    // 外部触发源全部关掉：只有 TZFRC 能触发
+    epwm->TZSEL.all = 0x0000U;
+
+    // 不开 TZ 中断（软件封波不需要中断）
+    epwm->TZEINT.all = 0x0000U;
+
+    // 清掉可能残留的触发标志
     epwm->TZCLR.all = 0xFFFFU;
 }
 
 /*===========================================================================
- * 函数名：Protect_InitOCP
- * 说明：初始化过流保护。先上 ADC bandgap（比较器共用），再配 COMP1/COMP2，
- *       最后给 EPWM1/EPWM2 挂触发链
- *       Protect_Enable = 0 时直接返回，所有相关寄存器保持复位值
+ * 函数名：Protect_Init
+ * 说明：无条件执行，与 Protect_Enable 无关（见 protect.h 的说明）
  *===========================================================================*/
-void Protect_InitOCP(void)
+void Protect_Init(void)
 {
-#if (Protect_Enable == 0)
-    // 保护关掉时什么都不做
-    // 关键：COMP、Digital Compare、Trip Zone 全部不配置，
-    // 这样即使比较器输入悬空也不会误触发 TZ 把四管封死
-    Protect_TripFlag   = 0U;
-    Protect_TripSource = 0U;
-    return;
-#else
-    Uint16 code;
+    Protect_UvFault = 0U;
+    Protect_OcFault = 0U;
+    Protect_UvCnt   = 0U;
+    Protect_OcCnt   = 0U;
 
-    // 比较器需要 ADC 的 bandgap 做参考，必须先上电并等稳定
     EALLOW;
-    SysCtrlRegs.PCLKCR0.bit.ADCENCLK   = 1;
-    SysCtrlRegs.PCLKCR3.bit.COMP1ENCLK = 1;
-#if (Use_Comp2_Negative == 1)
-    SysCtrlRegs.PCLKCR3.bit.COMP2ENCLK = 1;
-#endif
-    AdcRegs.ADCCTL1.bit.ADCBGPWD = 1;
+    Protect_ConfigTz(&EPwm1Regs);
+    Protect_ConfigTz(&EPwm2Regs);
     EDIS;
-
-    DELAY_US(1000L);
-
-    code = Protect_AmpsToDacCode(Trip_Amps_Default);
-
-    // COMP1：正向过流。COMPSOURCE=0 用内部 DAC 做反相输入，CMPINV=0 不反相
-    // 即 COMP1A(电感电流) > DAC 阈值 时输出高
-    EALLOW;
-    Comp1Regs.COMPCTL.bit.COMPDACEN  = 1;
-    Comp1Regs.COMPCTL.bit.COMPSOURCE = 0;
-    Comp1Regs.COMPCTL.bit.CMPINV     = 0;
-    Comp1Regs.COMPCTL.bit.QUALSEL    = 0;       // 不做限幅滤波，最快响应
-    Comp1Regs.COMPCTL.bit.SYNCSEL    = 0;       // 异步输出
-    Comp1Regs.DACVAL.bit.DACVAL      = code;
-    EDIS;
-
-#if (Use_Comp2_Negative == 1)
-    // COMP2：反向过流，输出反相，电感电流 < -阈值 时输出高
-    EALLOW;
-    Comp2Regs.COMPCTL.bit.COMPDACEN  = 1;
-    Comp2Regs.COMPCTL.bit.COMPSOURCE = 0;
-    Comp2Regs.COMPCTL.bit.CMPINV     = 1;
-    Comp2Regs.COMPCTL.bit.QUALSEL    = 0;
-    Comp2Regs.COMPCTL.bit.SYNCSEL    = 0;
-    Comp2Regs.DACVAL.bit.DACVAL      = code;
-    EDIS;
-#endif
-
-    // 两个 ePWM 模块都挂上触发链，中断只开 EPWM1 一路用来上报
-    EALLOW;
-    Protect_ConfigEpwmTrip(&EPwm1Regs);
-    Protect_ConfigEpwmTrip(&EPwm2Regs);
-
-    EPwm1Regs.TZEINT.bit.OST = 1;       // DCxEVT1 单次
-    EPwm1Regs.TZEINT.bit.CBC = 1;       // DCxEVT2 逐周期
-    EDIS;
-
-    Protect_TripFlag   = 0U;
-    Protect_TripSource = 0U;
-#endif
 }
 
 /*===========================================================================
- * 函数名：Protect_SetTripLevel
- * 说明：改过流阈值，单位 A，双向对称（Q24）
+ * 函数名：Protect_Update
+ * 说明：20kHz 中断里每拍调用。Q24 定点比较就是整数比较，不做任何转换
+ *       欠压不锁存（电压回来自动恢复），过流锁存
  *===========================================================================*/
-void Protect_SetTripLevel(_iq amps)
+void Protect_Update(_iq vin, _iq il)
 {
-#if (Protect_Enable == 0)
-    // 保护关闭，不碰比较器
-    (void)amps;
-    return;
-#else
-    Uint16 code;
-
-    if (amps < 0)               // 定点取绝对值就是整数取反
+    // ---- 欠压：连续 UV_Debounce 拍才认，电压回来立即清 ----
+    if (vin < UV_Volts)
     {
-        amps = -amps;
+        if (Protect_UvCnt < UV_Debounce)
+        {
+            Protect_UvCnt++;
+        }
     }
-    code = Protect_AmpsToDacCode(amps);
+    else
+    {
+        Protect_UvCnt = 0U;
+    }
 
-    EALLOW;
-    Comp1Regs.DACVAL.bit.DACVAL = code;
-#if (Use_Comp2_Negative == 1)
-    Comp2Regs.DACVAL.bit.DACVAL = code;
-#endif
-    EDIS;
+    Protect_UvFault = (Protect_UvCnt >= UV_Debounce) ? 1U : 0U;
+
+    // ---- 过流：绝对值比较，连续 OC_Debounce 拍才认，锁存 ----
+    if ((il > OC_Amps) || (il < -OC_Amps))
+    {
+        if (Protect_OcCnt < OC_Debounce)
+        {
+            Protect_OcCnt++;
+        }
+    }
+    else
+    {
+        Protect_OcCnt = 0U;
+    }
+
+    if (Protect_OcCnt >= OC_Debounce)
+    {
+        Protect_OcFault = 1U;
+    }
+
+    // ---- 动作：只在 Protect_Enable==1 时封波 ----
+    // 欠压的动作不在这里：欠压要切固定 0.85 正弦兜底，属于控制环，见 main.c
+#if (Protect_Enable == 1)
+    if (Protect_OcFault != 0U)
+    {
+        Protect_ForceStop();
+    }
 #endif
 }
 
 /*===========================================================================
- * 函数名：Protect_ClearTrip
- * 说明：清触发锁存并重新打开 TZ 中断源
- *       Trip ISR 里会主动关掉 TZEINT 以防止中断风暴，恢复输出时必须重新打开
+ * 函数名：Protect_Clear
+ * 说明：清过流锁存并清 TZ 触发，允许重新输出
  *===========================================================================*/
-void Protect_ClearTrip(void)
+void Protect_Clear(void)
 {
-#if (Protect_Enable == 0)
-    // 保护关闭，TZ 从来没被配置过，没有锁存要清
-    Protect_TripFlag   = 0U;
-    Protect_TripSource = 0U;
-    return;
-#else
+    Protect_OcFault = 0U;
+    Protect_OcCnt   = 0U;
+
     EALLOW;
     EPwm1Regs.TZCLR.bit.OST = 1;
-    EPwm1Regs.TZCLR.bit.CBC = 1;
     EPwm1Regs.TZCLR.bit.INT = 1;
-    EPwm1Regs.TZCLR.bit.DCAEVT1 = 1;
-    EPwm1Regs.TZCLR.bit.DCAEVT2 = 1;
-    EPwm1Regs.TZCLR.bit.DCBEVT1 = 1;
-    EPwm1Regs.TZCLR.bit.DCBEVT2 = 1;
-
     EPwm2Regs.TZCLR.bit.OST = 1;
-    EPwm2Regs.TZCLR.bit.CBC = 1;
-    EPwm2Regs.TZCLR.bit.DCAEVT1 = 1;
-    EPwm2Regs.TZCLR.bit.DCAEVT2 = 1;
-    EPwm2Regs.TZCLR.bit.DCBEVT1 = 1;
-    EPwm2Regs.TZCLR.bit.DCBEVT2 = 1;
-
-    // 重新武装中断源
-    EPwm1Regs.TZEINT.bit.OST = 1;
-    EPwm1Regs.TZEINT.bit.CBC = 1;
+    EPwm2Regs.TZCLR.bit.INT = 1;
     EDIS;
-
-    Protect_TripFlag   = 0U;
-    Protect_TripSource = 0U;
-#endif
 }
 
 /*===========================================================================
  * 函数名：Protect_ForceStop
- * 说明：软件急停，四管全关。置 TZFRC.OST 后立刻清 INT 标志，
- *       所以不会产生 TZ 中断，也不污染 Protect_TripFlag
- *       Protect_Enable = 0 时是空操作，否则一调用就把输出封死了
+ * 说明：软件封波。置 TZFRC.OST 后立刻清中断标志，所以不会产生 TZ 中断
+ *       注意：即使 Protect_Enable==0 也真的会封波 —— 这是"主动急停"，
+ *       只有 Protect_Update 里的自动判断才受 Protect_Enable 约束
  *===========================================================================*/
 void Protect_ForceStop(void)
 {
-#if (Protect_Enable == 0)
-    return;
-#else
     EALLOW;
     EPwm1Regs.TZFRC.bit.OST = 1;
     EPwm2Regs.TZFRC.bit.OST = 1;
     EPwm1Regs.TZCLR.bit.INT = 1;
     EPwm2Regs.TZCLR.bit.INT = 1;
     EDIS;
-#endif
-}
-
-/*===========================================================================
- * 函数名：Protect_SoftwareCheck
- * 说明：软件过流兜底，返回 1 表示越限（Q24，整数比较）
- *===========================================================================*/
-Uint16 Protect_SoftwareCheck(_iq i_fb, _iq i_limit)
-{
-    if (i_fb > i_limit)
-    {
-        return 1U;
-    }
-    if (i_fb < -i_limit)
-    {
-        return 1U;
-    }
-    return 0U;
 }
