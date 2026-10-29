@@ -458,6 +458,16 @@
     (Iref_Peak_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
 #define Iref_Ref_Step       _IQ(Iref_Ref_Step_F)        // Q24：5.883e-4 -> 9870
 
+// ---- 8c. 欠压兜底（Protect_Enable=1 且 Vin < UV_Volts 时） ----
+// 动作：切到 50Hz 正弦、幅值 0.85 的固定调制比（开环兜底），
+//       幅值走自己的斜坡 UvRamp 从 0 爬到 Mod_Max，
+//       每次进入欠压状态时清零重爬，避免把 0.85 全幅一步打进 LC。
+// 注意是"正弦幅值 0.85"，不是"调制比恒等于 0.85"——后者是直流，
+//       会把电感单向充起来。
+#define Uv_Ref_Step_F \
+    (Mod_Max_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
+#define Uv_Ref_Step         _IQ(Uv_Ref_Step_F)          // Q24：1.7e-3 -> 28508
+
 // ---- 9. 中断计时脚 ----
 // GPIO4 配成普通 GPIO 输出，进 ADC 中断拉高、退出前拉低
 // 用它判断两件事：有没有脉冲 = ADC 中断在不在跑；脉宽 = 控制环耗时

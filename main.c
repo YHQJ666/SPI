@@ -125,6 +125,9 @@ volatile _iq  VinFF  = _IQ(Vbus_Nominal);            // 母线电压（滤波后
 volatile _iq  InvVin = _IQ(1.0f / Vbus_Nominal);     // 1/Vin，后台更新
 volatile _iq  V_L    = 0;                            // PI 输出电压，只给 SFRA 取地址
 
+// 欠压兜底的调制比幅值：0 -> Mod_Max，进入欠压状态时清零重爬（见 dcac_cfg.h 8c）
+volatile _iq  UvRamp = 0;
+
 // 输入侧两路采样：只存 ADC 原始码，不参与控制环，后续留给输入过压/过流保护。
 // 换算成工程量（加保护阈值时用）：
 //   输入电压 V = (VinRaw - ADC_Vin_Offset) * ADC_Vin_Span / 4096
@@ -327,6 +330,7 @@ void main(void){
                 Protect_ForceStop();
                 RefRamp = 0;
                 IRamp   = 0;
+                UvRamp  = 0;
                 PhaseAcc = 0U;
             }
         }
@@ -352,6 +356,7 @@ void main(void){
             PI_I.Integral = 0;
             RefRamp = 0;
             IRamp   = 0;
+            UvRamp  = 0;
             PhaseAcc = 0U;
         }
 
@@ -475,6 +480,7 @@ __interrupt void ADC_ISR(void)
         PI_I.Integral = 0;
         RefRamp = 0;
         IRamp   = 0;
+        UvRamp  = 0;
         Mod = 0;
         SPWM_SetNeutral();
     }
@@ -595,6 +601,36 @@ __interrupt void ADC_ISR(void)
         V_L = PI_Calc(&PI_I);                       // Q24，单位 V
 
         Mod = _IQmpy(V_L + VoutFF, InvVin);         // 无量纲调制比
+
+#if (Protect_Enable == 1)
+        // ---- 欠压兜底：切固定 0.85 幅值正弦，覆盖上面算出来的电流环输出 ----
+        // 幅值走自己的斜坡 UvRamp，Run_Enable 门控；
+        // 退出时清零，下次进入重新从 0 爬（Review Focus 4）
+        if (Protect_UvFault != 0U)
+        {
+            if (Run_Enable != 0U)
+            {
+                UvRamp += Uv_Ref_Step;
+                if (UvRamp > Mod_Max)
+                {
+                    UvRamp = Mod_Max;
+                }
+            }
+            else
+            {
+                UvRamp = 0;
+            }
+
+            Mod = _IQmpy(sin_val, UvRamp);
+            PI_I.Integral = 0;      // 不让闭环历史带进来
+            V_L = 0;
+            IRef = 0;
+        }
+        else
+        {
+            UvRamp = 0;
+        }
+#endif
 
 #elif (LOOP_MODE == LOOP_VOLT_CLOSED)
         // ---- 电压单环：电流环旁路，PR 输出直接当调制比 ----
