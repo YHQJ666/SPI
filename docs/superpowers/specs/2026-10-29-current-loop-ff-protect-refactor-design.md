@@ -278,6 +278,15 @@ mode 3 用 `KP_I3/KI_I3` + `±Mod_Max`。否则 mode 3 会被静默放大 60 倍
 
 ## 八、验收
 
+> **实施结果（2026-10-30 补记）**：
+> - gmake 全量重编 + 链接 EXIT=0，只有 spwm.c 那条改前就有的 warning
+> - ADC_ISR 反汇编：394 字、5 个函数调用、**0 个 F$$ 浮点、0 个除法**
+> - 五配置编译通过：默认 / DEBUG_VIEW_ENABLE=1 / SFRA_ENABLE=1 / Protect_Enable=1 / LOOP_MODE=3
+> - 行数：main.c **984**（原 1478）、debug_view.c 219、oled_task.c 234、sfra_task.c 227、protect.c 132
+> - ★ **RAM 版代码区只剩 14 字**（CODERAM 0x19F2/0x1A00），LOOP_MODE=1/3 现在链不过，要跑那两个模式得换 28035_FLASH_lnk.cmd
+> - 台架项（mod 跟踪、欠压切换、IsrCyclesMax<3000）**尚未验证**
+
+
 - `gmake` 全量重编 + 链接通过，无新增 warning。
 - 反汇编确认 20kHz 中断里没有 `F$$` 浮点调用、没有除法调用。
 - 默认配置下 `main.c` **目标** 700 行以内（原 1478 行）。
