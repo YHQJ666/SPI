@@ -79,10 +79,25 @@
 
 // ---- 电流环 PI（LOOP_CURR_CLOSED）----
 // ★ 量纲随 Task 5（前馈）一起改：现在 PI 输出直接当调制比，所以是 mod/A；
-//   加上前馈之后 PI 输出变成"电压"，这一对要改成 9.6 V/A / 11.46（× Vbus 60V）。
+//   加上前馈之后 PI 输出变成"电压"，这一对要改成 9.6 V/A（× Vbus 60V）。
 // Ki = 0 就是纯 P：被控对象是 1/(sL)，纯 P 在 50Hz 处 Kp/(wL) 已经足够大
-#define KP_I                _IQ(0.16f)    // [mod/A]  -> 前馈后改 [V/A]
+//   （L ≈ 0.29mH 由 SFRA 实测的 +14.9dB@100Hz 反推，wL = 0.091，
+//     Kp/(wL) ≈ 105，静差约 1%）
+#define KP_I                _IQ(9.6f)     // [V/A] = 旧值 0.16 mod/A × 60V
 #define KI_I                0.0f          // [1/s]，0 = 纯 P
+
+// ---- 前馈相关的滤波与钳位 ----
+// VoutFF / VinFF 都是一阶 IIR：y += (x - y) >> Vff_Shift
+//   shift=2 -> 转折 ≈ 20k/(2pi*4) ≈ 795Hz，对 50Hz 相位滞后 ≈ 3.6°
+//   为什么要滤：喂进前馈的 Vout 带着开关纹波，不滤等于把纹波灌进占空比；
+//   母线也带 100Hz 脉动，1/Vin 差 1V 就是 1.7% 的占空比误差
+#define Vff_Shift           2U
+// 1/Vin 的钳位范围。下限就是欠压阈值（闭环只在 Vin >= 55V 时运行），
+// 上限防过压时 1/Vin 太小导致前馈量不足
+#define Vin_Ff_Min_F        55.0f
+#define Vin_Ff_Max_F        90.0f
+#define Vin_Ff_Min          _IQ(Vin_Ff_Min_F)
+#define Vin_Ff_Max          _IQ(Vin_Ff_Max_F)
 
 // ---- 双环 PI（LOOP_DUAL）----
 // 双环那条路的 PI 输出直接当调制比用，量纲还是 mod/A，所以要单独一套，

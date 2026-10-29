@@ -112,6 +112,19 @@ volatile Uint32 PhaseAcc = 0;       // 相位累加器：高 8 位查表下标�
 volatile _iq  RefRamp = 0;          // 软启动给定峰值
 volatile _iq  IRamp = 0;            // 电流环给定的软启动幅值（A），只给 LOOP_CURR_CLOSED 用
 
+//===========================================================================
+// 电流环前馈（LOOP_CURR_CLOSED）：mod = (V_L + VoutFF) * InvVin
+//   V_L    : PI 输出 = 电感压降给定 L*di/dt，单位 V（不再是调制比）
+//   VoutFF : 输出电压实测值，一阶 IIR 低通后当前馈用
+//   VinFF  : 母线电压实测值，同样低通
+//   InvVin : 1/VinFF，★ 在后台每 20ms 算一次，中断里只做乘法（除法太贵）
+// ★ InvVin 必须给初值：.ebss 是 0，不清的话第一拍 mod 就是 0
+//===========================================================================
+volatile _iq  VoutFF = 0;                            // 输出电压前馈（滤波后）V
+volatile _iq  VinFF  = _IQ(Vbus_Nominal);            // 母线电压（滤波后）V
+volatile _iq  InvVin = _IQ(1.0f / Vbus_Nominal);     // 1/Vin，后台更新
+volatile _iq  V_L    = 0;                            // PI 输出电压，只给 SFRA 取地址
+
 // 输入侧两路采样：只存 ADC 原始码，不参与控制环，后续留给输入过压/过流保护。
 // 换算成工程量（加保护阈值时用）：
 //   输入电压 V = (VinRaw - ADC_Vin_Offset) * ADC_Vin_Span / 4096
@@ -249,16 +262,28 @@ void main(void){
     PR_V.OutMin = -Mod_Max;
     PR_V.OutMax =  Mod_Max;
 
-    // 初始化 PI_I：电容电流内环，输出就是调制比
+    // 初始化 PI_I
+    // ★ 量纲随模式不同：
+    //   LOOP_CURR_CLOSED：前馈结构，PI 输出是电压（V），限幅每拍在 ISR 里按余量重设
+    //   其它模式        ：PI 输出直接当调制比，限幅 ±Mod_Max
     PI_I.Ref = 0;
     PI_I.Fdb = 0;
-    PI_I.Kp = KP_I;
-    PI_I.KiTs = KI_I_Ts;  // 积分增益已经折进采样周期 Ki*Ts
     PI_I.Integral = 0;
+#if (LOOP_MODE == LOOP_CURR_CLOSED)
+    PI_I.Kp     = KP_I;                 // V/A
+    PI_I.KiTs   = KI_I_Ts;
+    PI_I.IntMin = _IQ(-(Mod_Max_F * Vbus_Nominal));   // -51V，ISR 里每拍重设
+    PI_I.IntMax = _IQ( (Mod_Max_F * Vbus_Nominal));   // +51V
+    PI_I.OutMin = PI_I.IntMin;
+    PI_I.OutMax = PI_I.IntMax;
+#else
+    PI_I.Kp     = KP_I3;                // mod/A
+    PI_I.KiTs   = KI_I3_Ts;
     PI_I.IntMin = -Mod_Max;
     PI_I.IntMax =  Mod_Max;
     PI_I.OutMin = -Mod_Max;
     PI_I.OutMax =  Mod_Max;
+#endif
 
     // ---- CpuTimer0 配成自由运行的周期计数器，给 ADC_ISR 量耗时 ----
     //   PRD 拉满 -> 从 0xFFFFFFFF 往下数，60MHz 下 71.6s 才绕回，够用
@@ -335,11 +360,22 @@ void main(void){
         Oled_Task_Run(IsrCnt, FaultLatch);
 
         // 后台：满一个工频周期（20ms）做一次
-        //   1) 刷调试镜像的有效值（debug_view.c）
-        //   2) 重算 1/Vin（Task 5 用）
+        //   1) 重算 1/Vin（前馈用。母线是毫秒级变化，20ms 更新足够，
+        //      顺带把 64/32 除法挪出 20kHz 中断）
+        //   2) 刷调试镜像的有效值（debug_view.c）
         if (RmsCommit != 0U)
         {
             RmsCommit = 0U;
+
+            {
+                _iq vs = VinFF;
+
+                if (vs < Vin_Ff_Min) { vs = Vin_Ff_Min; }   // Review Focus 1
+                if (vs > Vin_Ff_Max) { vs = Vin_Ff_Max; }   // Review Focus 2
+
+                InvVin = _IQdiv(_IQ(1.0f), vs);
+            }
+
             Debug_View_Background();
         }
     }
@@ -531,7 +567,34 @@ __interrupt void ADC_ISR(void)
 
         PI_I.Ref = IRef;
         PI_I.Fdb = IL;
-        Mod = PI_Calc(&PI_I);
+
+        // ---- 前馈：mod = (V_L + VoutFF) * (1/Vin) ----
+        // 结构照 TI 逆变器例程式 (12)：invDutyPU = (Gi + invVoltInst)/invVbusInst
+        //   分子 = 电感压降给定 + 输出电压（都是电压量纲）
+        //   分母 = 母线电压，用后台算好的倒数，中断里只做乘法
+        // 先把 Vout / Vin 滤波：开关纹波和母线 100Hz 脉动不能直接灌进占空比
+        VoutFF += (Vout - VoutFF) >> Vff_Shift;
+        VinFF  += (Vin  - VinFF)  >> Vff_Shift;
+
+        // 动态限幅：PI 只该用到"这一拍真正的电压余量"
+        //   静态限幅会让积分一路涨到饱和、而占空比早就限死在 0.85（Review Focus 3）
+        //   head 必须钳到 >= 0：母线跌落时 0.85*Vin 会小于 Vout，负限幅会让
+        //   OutMax < OutMin，PI_Calc 里的 __clamp 就变成乱数
+        {
+            _iq head = _IQmpy(Mod_Max, VinFF) - VoutFF;
+
+            if (head < 0)
+            {
+                head = 0;
+            }
+
+            PI_I.OutMax =  head;  PI_I.IntMax =  head;
+            PI_I.OutMin = -head;  PI_I.IntMin = -head;
+        }
+
+        V_L = PI_Calc(&PI_I);                       // Q24，单位 V
+
+        Mod = _IQmpy(V_L + VoutFF, InvVin);         // 无量纲调制比
 
 #elif (LOOP_MODE == LOOP_VOLT_CLOSED)
         // ---- 电压单环：电流环旁路，PR 输出直接当调制比 ----
@@ -574,7 +637,12 @@ __interrupt void ADC_ISR(void)
         // 参考量 r 由 SFRA_IQ_INJECT 自己记着，所以电压环这里要传 PR 的输出 IRef，
         // 不能传 PR_V.Ref（那等于 u = r，算出来的是闭环增益 Y/R，不是受控体）
         // 每个中断只能调用一次 INJECT / 一次 COLLECT
-#if (LOOP_MODE == LOOP_FIXED_DUTY) || (LOOP_MODE == LOOP_CURR_CLOSED)
+#if (LOOP_MODE == LOOP_CURR_CLOSED)
+        // ★ 前馈之后受控体的输入是"桥臂电压指令" V_L，不是占空比：
+        //   duty 还要除母线、加输出电压前馈，拿 duty 当输入量出来的是另一条传函。
+        //   TI 例程同样采补偿器输出（SFRA_F_COLLECT(&cntl3p3z_InvI_vars.Out, ...)）
+        SFRA_COL(&V_L, &IL);
+#elif (LOOP_MODE == LOOP_FIXED_DUTY)
         SFRA_COL(&Mod, &IL);
 #else
         SFRA_COL(&IRef, &Vout);
