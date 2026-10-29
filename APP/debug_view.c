@@ -131,6 +131,10 @@ void Debug_View_SetCalPin(float vo, float io, float il)
  *===========================================================================*/
 void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
 {
+#if (SFRA_ENABLE == 0)
+    /* ★ 必须跟着 SFRA_ENABLE 一起关：清累加器的机会在后台
+       Debug_View_Background 里，而那个函数在扫频版是空的。
+       不关的话 64 位累加器永远不会清零，51V 下约 41s 就溢出（有符号溢出是 UB）。 */
     long xv = (long)(vout >> 8);
     long xi = (long)(iout >> 8);
     long xl = (long)(il   >> 8);
@@ -151,6 +155,9 @@ void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
             ModPk = ax;
         }
     }
+#else
+    (void)vout; (void)iout; (void)il; (void)vin; (void)iin; (void)mod;
+#endif
 }
 
 /*===========================================================================

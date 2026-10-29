@@ -28,6 +28,10 @@
 #include "IQmathLib.h"
 #include "dcac_cfg.h"
 
+// 欠压退出（回落）所需的连续正常拍数。UV_Debounce 那条在 dcac_cfg.h 常改区。
+// 20 拍 @20kHz = 1ms，比 100Hz 母线的半周期(5ms)小得多，不会把真跌电压当成噪声
+#define UV_Clear_Debounce   20U
+
 // 故障码：main.c 根据下面两个标志算出来，OLED 用来显示
 //   硬件 Trip 已经删掉了，只剩这两个
 #define FAULT_NONE      (0U)
@@ -41,11 +45,15 @@ extern volatile Uint16 Protect_OcFault;
 
 // 去抖计数（调试观察用）
 extern volatile Uint16 Protect_UvCnt;
+extern volatile Uint16 Protect_UvClrCnt;
 extern volatile Uint16 Protect_OcCnt;
 
 // 无条件调用，即使 Protect_Enable==0 也要调：
-// 它只把 TZCTL 配成 force-low、TZSEL 清零。复位值 TZCTL=0xFFFF 是
-// "强制输出高"，不配的话一旦软件封波反而会把四管拉高，很危险。
+// 它把 TZCTL 的 TZA/TZB 和四个 DCxEVT 通道都写成 force-low，并只选单次(OSHT)触发源。
+// ★ 复位值 TZCTL = 0xFFFF，按位域拆开是 TZA=3/TZB=3/DCxEVTn=3，而 3 = "不动作"，
+//   也就是复位状态下触发一次并不会关输出，必须显式写成 force-low 才有保护。
+// ★ 不要为了"清干净"把 TZSEL 整个写 0：那样连 OSHT1..6 一起清掉，
+//   单次触发源就没了，spec 要求 OSHT=1。
 void Protect_Init(void);
 
 // ADC 中断里每拍调用，参数是 Q24 的母线电压和电感电流

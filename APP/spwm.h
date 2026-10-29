@@ -59,7 +59,7 @@ void SPWM_SetNeutral(void);
 // 读回右桥臂（EPWM1，GPIO0/1）当前 CMPA，调试观察用
 Uint16 SPWM_GetCmp(void);
 
-// 启停/故障封锁统一走 Trip Zone（Protect_ForceStop / Protect_ClearTrip），
+// 启停/故障封锁统一走 Trip Zone（Protect_ForceStop / Protect_Clear），
 // 不要用 AQCSFRC 去封：AQCSFRC 只作用在 AQ 上，经死区子模块取反后
 // EPWMxB 反而会变高，不是真正的四管全关
 

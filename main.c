@@ -16,8 +16,8 @@
  *   ADC_ISR：换算工程量 -> 电容电流 i_c = i_L - i_o -> 查表
  *            -> 电压外环 PR -> 电容电流给定 -> 电流内环 PI
  *            -> mod 限幅 +-0.85 -> 写 EPWM1/EPWM2 CMPA
- *   COMP1/COMP2 -> ePWM Digital Compare -> Trip Zone -> 四管直接拉低
- *              纯硬件，CPU 跑飞也能保护
+ *   保护：纯软件（欠压 Vin<55V / 过流 |IL|>12A），见 APP/protect.c
+ *         TZ 只保留
  *
  * 定点化：F28035 没有硬件 FPU，浮点全靠软件模拟，20kHz 中断里跑两个调节器
  * 很吃 CPU。本工程把控制环整体改成 TI IQmath 定点，全局格式 Q24
@@ -625,6 +625,7 @@ __interrupt void ADC_ISR(void)
             PI_I.Integral = 0;      // 不让闭环历史带进来
             V_L = 0;
             IRef = 0;
+            IRamp = 0;              // 回闭环时电流给定从 0 重爬，不能一步跳回 5.88A
         }
         else
         {

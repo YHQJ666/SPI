@@ -13,6 +13,7 @@
 volatile Uint16 Protect_UvFault = 0U;
 volatile Uint16 Protect_OcFault = 0U;
 volatile Uint16 Protect_UvCnt   = 0U;
+volatile Uint16 Protect_UvClrCnt = 0U;
 volatile Uint16 Protect_OcCnt   = 0U;
 
 /*===========================================================================
@@ -31,8 +32,11 @@ static void Protect_ConfigTz(volatile struct EPWM_REGS *epwm)
     epwm->TZCTL.bit.DCBEVT1 = TZ_FORCE_LO;
     epwm->TZCTL.bit.DCBEVT2 = TZ_FORCE_LO;
 
-    // 外部触发源全部关掉：只有 TZFRC 能触发
-    epwm->TZSEL.all = 0x0000U;
+    // 外部触发源只选单次（OSHT1）。逐周期 CBC 和 Digital Compare 事件全不选。
+    // ★ 不要把 TZSEL 整个清零：spec 要求 OSHT=1，清零会把 OSHT1..6 一起清掉。
+    //   TZSEL 位定义（DSP2803x_EPwm.h）：bit0-5 = CBC1..6，bit6/7 = DCAEVT2/DCBEVT2，
+    //   bit8-13 = OSHT1..OSHT6。写 0x0100 = 只有 OSHT1。
+    epwm->TZSEL.all = 0x0100U;
 
     // 不开 TZ 中断（软件封波不需要中断）
     epwm->TZEINT.all = 0x0000U;
@@ -65,17 +69,28 @@ void Protect_Init(void)
  *===========================================================================*/
 void Protect_Update(_iq vin, _iq il)
 {
-    // ---- 欠压：连续 UV_Debounce 拍才认，电压回来立即清 ----
+    // ---- 欠压：进入要连续 UV_Debounce 拍，退出也要连续 UV_Clear_Debounce 拍 ----
+    // ★ 退出没有去抖的话：母线在 55V 上下抖一格，标志就掉一下，
+    //   main.c 那边 UvRamp 会被清零重爬，兜底输出直接塌掉（评审指出）
     if (vin < UV_Volts)
     {
         if (Protect_UvCnt < UV_Debounce)
         {
             Protect_UvCnt++;
         }
+        Protect_UvClrCnt = 0U;
     }
     else
     {
-        Protect_UvCnt = 0U;
+        if (Protect_UvClrCnt < UV_Clear_Debounce)
+        {
+            Protect_UvClrCnt++;
+        }
+
+        if (Protect_UvClrCnt >= UV_Clear_Debounce)
+        {
+            Protect_UvCnt = 0U;
+        }
     }
 
     Protect_UvFault = (Protect_UvCnt >= UV_Debounce) ? 1U : 0U;

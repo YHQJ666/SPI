@@ -466,13 +466,13 @@
 //       会把电感单向充起来。
 #define Uv_Ref_Step_F \
     (Mod_Max_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
-#define Uv_Ref_Step         _IQ(Uv_Ref_Step_F)          // Q24：1.7e-3 -> 28508
+#define Uv_Ref_Step         _IQ(Uv_Ref_Step_F)          // Q24：8.5e-5 -> 1426（10000 拍 = 500ms）
 
 // ---- 9. 中断计时脚 ----
-// GPIO4 配成普通 GPIO 输出，进 ADC 中断拉高、退出前拉低
+// GPIO5 配成普通 GPIO 输出，进 ADC 中断拉高、退出前拉低
 // 用它判断两件事：有没有脉冲 = ADC 中断在不在跑；脉宽 = 控制环耗时
 // 定点化以后控制环应该明显快于原来的软件浮点版本，可以直接用脉宽对比
-#define ISR_Test_Pin    4U
+#define ISR_Test_Pin    5U      // ★ 实际用的是 GPIO5（GPIO4 上看不到脉冲，已换）
 
 // ---- 10. 调试器观察用浮点镜像 ----
 // 控制量都是 Q24，调试器里显示的是原始整数（真值 = 原始整数 / 16777216），
