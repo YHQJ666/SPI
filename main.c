@@ -48,6 +48,7 @@
 #include "pr.h"
 #include "spwm.h"
 #include "protect.h"
+#include "debug_view.h"                 // 调试镜像 / 有效值 / 示波器缓冲（Task 2 拆出去）
 #include "Oled.h"                       // 0.96 寸 OLED（SSD1306，I2C 位带，GPIO28/29）
 #include "sfra_cfg.h"                   // SFRA 扫频（SFRA_ENABLE=1 时才有内容）
 
@@ -136,81 +137,11 @@ volatile long VoutOffNeg = 0L;
 volatile long IoutOffNeg = 0L;
 volatile long ILOffNeg   = 0L;
 
-// 校零实测到的引脚电压（V），只给 OLED 显示 Z: 用
-// 输入侧(Vin/Iin)不做校零，它们没有直流偏置
-volatile float CalPinVout = 0.0f;
-volatile float CalPinIout = 0.0f;
-volatile float CalPinIL   = 0.0f;
-
-//===========================================================================
-// 有效值 / 平均值累加器（真有效值，做法参考 TI sineAnalyzerWithPowerMeas）
-// C28x 的 long 是 32 位，累加平方会溢出，所以累加器必须用 long long；
-// 而且 x 先右移 8 位（Q24->Q16）再平方，否则 400 拍同样会溢出：
-//   51V 时 (51*2^16)^2 * 400 = 4.5e15 < 9.2e18  OK
-//===========================================================================
-volatile long long RmsVoutSq = 0;
-volatile long long RmsIoutSq = 0;
-volatile long long RmsILSq   = 0;
-volatile long long AvgVinSum = 0;
-volatile long long AvgIinSum = 0;
-
-// 调制比用一个工频周期内的峰值保持，不平方：
-//   Mod 是正弦，幅值就是它的峰值，直接取 |Mod| 的最大值最直观，
-//   而且削顶时读到的正好是限幅值（比如 0.85），不会像 RMS*sqrt(2)
-//   那样把方波算成 0.85*1.414=1.2 这种虚高值
-volatile _iq ModPk = 0;
-
+// 有效值/平均值/示波器全部搬到 APP/debug_view.c 了。
+// 这里只留"满一个工频周期"的节拍：Task 5 的 1/Vin 后台更新要挂在它上面，
+// 所以它不属于调试模块。
 volatile Uint16 RmsCnt    = 0U;
 volatile Uint16 RmsCommit = 0U;
-
-//===========================================================================
-// 示波器数据缓冲区：CCS 的 Graph 工具按"数组名 + 长度"读一段连续内存，
-// 所以必须用全局数组（参考 TI 参考设计里的 float dBuff1[200]）。
-// 存的是**瞬时值**（ADCRESULT 减直流偏置再换算成工程量），用来当示波器看波形。
-// 用 float：Graph 里 Data Type 直接选 "32 bit floating point"、Q_Value=0。
-//
-// F28035 只有 10K 字 RAM，加了 OLED 之后已经很紧，所以只留 2 个电流通道：
-//   ScopeIout / ScopeIL，每通道 128 点（float 占 2 字）
-// 输出电压和电容电流的波形都不存（OLED 上有有效值，电流环也不再用电容电流）。
-// 地址固定在链接器 SCOPEBUF / SCOPEBUF2 段，代码长度变化不会挪动它们。
-//===========================================================================
-#define Scope_Size      128U
-
-// RMS 一阶 IIR 平滑系数 1/2^Rms_SmoothShift。
-// ★ 注意更新率是 50Hz（每 20ms 一次），不是 20kHz！
-//   时间常数 = 2^shift × 20ms：
-//     shift=2  -> 80 ms，3τ≈240ms 收敛
-//     shift=1  -> 40 ms，3τ≈120ms 收敛
-//   400 点正好一个工频周期，原始 RMS 已经比较稳，这里只做轻微平滑
-#define Rms_SmoothShift 2U
-
-// ScopeIout / ScopeIL 各 128 点（float 占 2 字 -> 每通道 256 字），
-// 都放 scopeBufs（SCOPEBUF，0x8600，512 字）；scopeBufs2 保留下来给以后加通道用。
-// ★ 只有 OLED 版(SFRA_ENABLE=0)才用示波器缓冲，扫频版关掉，省出 512 字给 SFRA 结果数组。
-//   48 点时要 5 个数组 x 48 x 2 = 480 字，原来 128 点 512 字的 scopeBufs 会把它挤爆
-//   （报错: scopeBufs 1 00000000 00000200 FAILED TO ALLOCATE）。
-#if (SFRA_ENABLE == 0)
-#pragma DATA_SECTION(ScopeIout, "scopeBufs")
-#pragma DATA_SECTION(ScopeIL,   "scopeBufs")
-
-volatile float ScopeIout[Scope_Size];   // 输出电流瞬时值 A
-volatile float ScopeIL[Scope_Size];     // 电感电流瞬时值 A
-volatile Uint16 ScopeIdx = 0U;          // 写指针
-volatile Uint16 ScopeCnt = 0U;          // 抽取计数
-
-// 抽取倍数：每 N 个中断存 1 点（128 点一屏）。
-//   1 -> 20kHz，一屏 6.4ms  = 0.3 个工频周期（看开关纹波细节）
-//   3 -> 6.7kHz，一屏 19ms  = 1 个工频周期
-//   5 ->  4kHz，一屏 32ms  = 1.6 个工频周期
-// 改完 Graph 的 Sampling Rate Hz 要跟着改成 20000/N
-volatile Uint16 Scope_Prescale = 5U;
-#endif  /* SFRA_ENABLE == 0 : 示波器缓冲只在 OLED 版需要 */
-
-// RMS 平滑滤波状态（Q24 定点，每 20ms 更新一次）
-volatile _iq FiltVout = 0;
-volatile _iq FiltIout = 0;
-volatile _iq FiltIL   = 0;
-volatile _iq FiltMod  = 0;
 
 // 运行控制与故障
 //===========================================================================
@@ -236,33 +167,6 @@ volatile Uint32 IsrCycles    = 0UL; // 本次中断执行耗时（计数）
 volatile Uint32 IsrCyclesMax = 0UL; // 历史最大耗时（计数）← 峰值最有用
 volatile Uint32 IsrPeriod    = 0UL; // 两次中断的间隔（计数，应恒为 3000）
 
-#if (Debug_Float_View == 1)
-//===========================================================================
-// 调试器观察用浮点镜像
-//   上面的控制量都是 Q24 定点，调试器里显示的是原始整数（真值 = 值/16777216）。
-//   这里把同一批量换算成工程量存一份 float，调试器里把 Debug_View 加进
-//===========================================================================
-volatile struct
-{
-    // 有效值 / 幅值（滤波后，给 Expressions 固定看）
-    float VoutRms;      // 输出电压有效值 Vrms
-    float IoutRms;      // 输出电流有效值 Arms
-    float VoutAmp;      // 输出电压幅值 V（= VoutRms*1.414）
-    float IoutAmp;      // 输出电流幅值 A
-    float ILRms;        // 电感电流有效值 Arms
-    float ModAmp;       // 调制比幅值（RMS*1.414，稳态值，不是瞬时值）
-
-    // 输入侧（直流）
-    float Vin;          // 输入电压 V
-    float Iin;          // 输入电流 A
-
-    // 校零时三个有偏置通道的引脚电压（V），给 OLED 的 Z: 显示
-    float CalPinIout;   // 输出电流通道
-    float CalPinVout;   // 输出电压通道
-    float CalPinIL;     // 电感电流通道
-} Debug_View;
-
-#endif
 
 #if (SFRA_ENABLE == 0)
 //===========================================================================
@@ -639,6 +543,9 @@ void main(void){
     Adc_ZeroCal();
     Adc_Config();
 
+    // 调试镜像：清零累加器和滤波器状态（ADC 校零之后调用，校零结果已经交出去）
+    Debug_View_Init();
+
 #if (SFRA_ENABLE == 0)
     OLED_Init();
     OLED_Clear();
@@ -817,70 +724,15 @@ void main(void){
         }
 #endif
 
-#if (Debug_Float_View == 1)
-        // 后台：算有效值 -> 平滑 -> 刷新调试镜像
-        // 全部在后台空转循环里做，20kHz 中断里一次不做
+        // 后台：满一个工频周期（20ms）做一次
+        //   1) 刷调试镜像的有效值（debug_view.c）
+        //   2) 重算 1/Vin（Task 5 用）
+        if (RmsCommit != 0U)
         {
-            // 有效值：用 ISR 累加好的平方和，每工频周期(20ms)一次
-            if (RmsCommit != 0U)
-            {
-                float msV;
-                float msI;
-                float msL;
-
-                RmsCommit = 0U;
-
-                // 累加器是 sum((x>>8)^2) = sum(A^2 * 2^32)
-                // 均值 = /N，再 /2^32 就回到 A^2 的真实值（V^2 / A^2）
-                msV = (float)RmsVoutSq / (float)Rms_Cycle_Samples / 4294967296.0f;
-                msI = (float)RmsIoutSq / (float)Rms_Cycle_Samples / 4294967296.0f;
-                msL = (float)RmsILSq   / (float)Rms_Cycle_Samples / 4294967296.0f;
-
-                // 开方得真实有效值，再走一阶 IIR 平滑：
-                //   y += (x - y) / 2^Rms_SmoothShift
-                // 每 20ms 更新一次，shift=2 -> 时间常数 80ms
-                {
-                    _iq xv = (_iq)(sqrtf(msV) * 16777216.0f);
-                    _iq xi = (_iq)(sqrtf(msI) * 16777216.0f);
-                    _iq xl = (_iq)(sqrtf(msL) * 16777216.0f);
-                    _iq xm = ModPk;         // 本周期 |Mod| 的峰值
-
-                    ModPk = 0;              // 清掉，下个周期重新找
-
-                    FiltVout += (xv - FiltVout) >> Rms_SmoothShift;
-                    FiltIout += (xi - FiltIout) >> Rms_SmoothShift;
-                    FiltIL   += (xl - FiltIL)   >> Rms_SmoothShift;
-                    FiltMod  += (xm - FiltMod)  >> Rms_SmoothShift;
-
-                    Debug_View.VoutRms = _IQtoF(FiltVout);
-                    Debug_View.IoutRms = _IQtoF(FiltIout);
-                    Debug_View.ILRms   = _IQtoF(FiltIL);
-                    Debug_View.ModAmp  = _IQtoF(FiltMod);   // 峰值就是幅值，不用再乘
-                }
-
-                Debug_View.VoutAmp = Debug_View.VoutRms * 1.41421356f;
-                Debug_View.IoutAmp = Debug_View.IoutRms * 1.41421356f;
-
-                Debug_View.Vin = (float)AvgVinSum / (float)Rms_Cycle_Samples
-                               / 16777216.0f;
-                Debug_View.Iin = (float)AvgIinSum / (float)Rms_Cycle_Samples
-                               / 16777216.0f;
-
-                RmsVoutSq = 0;
-                RmsIoutSq = 0;
-                RmsILSq   = 0;
-                AvgVinSum = 0;
-                AvgIinSum = 0;
-            }
-
-            // 校零实测的引脚电压（CalPinXxx 在 Adc_ZeroCal 里只算一次，
-            // 这里只是搬到 Debug_View 给 OLED 用）
-            Debug_View.CalPinVout = CalPinVout;
-            Debug_View.CalPinIout = CalPinIout;
-            Debug_View.CalPinIL   = CalPinIL;
+            RmsCommit = 0U;
+            Debug_View_Background();
         }
     }
-#endif
 }
 
 
@@ -931,64 +783,17 @@ __interrupt void ADC_ISR(void)
     Vin = ADC_To_IQ_Cal(AdcResult.ADCRESULT4, ADC_Vin_Offset, 0L, ADC_Vin_Span);
     Iin = ADC_To_IQ_Cal(AdcResult.ADCRESULT5, ADC_Iin_Offset, 0L, ADC_Iin_Span);
 
-#if (SFRA_ENABLE == 0)
-    // ---- 1b. 有效值 / 平均值累加 ----
-    // 先右移 8 位（Q24 -> Q16）再平方，累加器用 long long，避免溢出
-    {
-        long xv = (long)(Vout >> 8);
-        long xi = (long)(Iout >> 8);
-        long xl = (long)(IL   >> 8);
+    // ---- 1b. 有效值累加 + 示波器缓冲（实现在 debug_view.c）----
+    //   累加是纯定点整数运算；示波器缓冲受 DEBUG_VIEW_ENABLE 控制，关掉时是空函数
+    Debug_View_IsrUpdate(Vout, Iout, IL, Vin, Iin, Mod);
+    Debug_View_ScopeSample(Iout, IL);
 
-        RmsVoutSq += (long long)xv * (long long)xv;
-        RmsIoutSq += (long long)xi * (long long)xi;
-        RmsILSq   += (long long)xl * (long long)xl;
-    }
-    AvgVinSum += (long long)Vin;
-    AvgIinSum += (long long)Iin;
-
-    // 调制比取峰值：|Mod| 越大就越新，一个周期里留最大值
-    {
-        _iq ax = (Mod >= 0) ? Mod : -Mod;
-
-        if (ax > ModPk)
-        {
-            ModPk = ax;
-        }
-    }
-
+    // 满一个工频周期（400 拍 = 20ms）置一次提交标志，后台处理
     if (++RmsCnt >= Rms_Cycle_Samples)
     {
         RmsCnt = 0U;
         RmsCommit = 1U;
     }
-
-    // ---- 1c. 示波器缓冲：存瞬时值（float，工程量）----
-    // 存 float 而不是 int16：Graph 里选 "32 bit floating point" + Q_Value=0，
-    // 直接就是伏/安，不用配 Q 格式
-    {
-        Uint16 pre = Scope_Prescale;
-
-        if (pre == 0U)
-        {
-            pre = 1U;           // 防止在 Expressions 里误改成 0
-        }
-
-        if (++ScopeCnt >= pre)
-        {
-            ScopeCnt = 0U;
-
-            ScopeIout[ScopeIdx] = _IQtoF(Iout);
-            ScopeIL[ScopeIdx]   = _IQtoF(IL);
-
-            ScopeIdx++;
-            if (ScopeIdx >= Scope_Size)
-            {
-                ScopeIdx = 0U;
-            }
-        }
-    }
-
-#endif   /* SFRA_ENABLE == 0 : RMS/示波器只在 OLED 版跑 */
 
 #if (Debug_Fixed_Mod_En == 1)
 
@@ -1244,6 +1049,9 @@ void Adc_ZeroCal(void)
     long   zeroCode;
     long   nominal;
     long   offneg;
+    float  CalPinVo = 0.0f;     // 实测引脚电压，最后一次性交给 debug_view
+    float  CalPinIo = 0.0f;
+    float  CalPinIl = 0.0f;
 
     EALLOW;
     AdcRegs.ADCINTFLGCLR.all = 0x0001;      // 清掉可能残留的中断标志
@@ -1331,18 +1139,22 @@ void Adc_ZeroCal(void)
         {
             case 0U:
                 VoutOffNeg = offneg;    // ADCA0 输出电压零点
-                CalPinVout = (float)zeroCode * ADC_Vref / 4096.0f;
+                CalPinVo = (float)zeroCode * ADC_Vref / 4096.0f;
                 break;
             case 1U:
                 IoutOffNeg = offneg;    // ADCA1 输出电流零点
-                CalPinIout = (float)zeroCode * ADC_Vref / 4096.0f;
+                CalPinIo = (float)zeroCode * ADC_Vref / 4096.0f;
                 break;
             default:
                 ILOffNeg   = offneg;    // ADCA2 电感电流零点
-                CalPinIL   = (float)zeroCode * ADC_Vref / 4096.0f;
+                CalPinIl = (float)zeroCode * ADC_Vref / 4096.0f;
                 break;
         }
     }
+
+    // 把实测的引脚电压交给调试镜像（OLED 的 Z: 显示用）
+    Debug_View_SetCalPin(CalPinVo, CalPinIo, CalPinIl);
+
     // 恢复：轮询指针拨回 SOC0，SOC 挂起标志清掉
     AdcRegs.SOCPRICTL.bit.SOCPRIORITY = 1;
     while (AdcRegs.SOCPRICTL.bit.SOCPRIORITY != 1) {}
