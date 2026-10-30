@@ -47,6 +47,23 @@ typedef struct
 
 extern volatile Debug_View_Type Debug_View;
 
+//===========================================================================
+// 电流环健康度：用来区分"跟不上"是哪一类原因
+//   饱和率高          -> 没电压余量（母线太低 / 负载太重 / 给定太大），工况问题
+//   饱和率低但误差大  -> 环路增益或相位不对，调参问题
+// 每 20ms（一个工频周期）刷新一次
+//===========================================================================
+typedef struct
+{
+    float V_L_Amp;      // |V_L| 峰值，V —— PI 要了多大的电感压降
+    float IErr_Amp;     // |IRef - IL| 峰值，A —— 跟踪误差
+    float ModSatPct;    // |Mod| >= Mod_Max 的采样点占比，% —— 调制比贴限幅的程度
+    float PiSatPct;     // PI 输出被 OutMax/OutMin 限住的占比，% —— 余量耗尽的程度
+    float VinFF;        // 滤波后的母线电压，V（InvVin 就是它的倒数）
+} Debug_Loop_Type;
+
+extern volatile Debug_Loop_Type Debug_Loop;
+
 // 示波器缓冲（只在 DEBUG_VIEW_ENABLE==1 且 SFRA_ENABLE==0 时有内容）
 extern volatile float    ScopeIout[];
 extern volatile float    ScopeIL[];

@@ -13,6 +13,7 @@
 
 #include "debug_view.h"
 #include "dcac_cfg.h"
+#include "pid.h"
 #include <math.h>
 
 //===========================================================================
@@ -38,6 +39,20 @@ static volatile _iq FiltVout = 0;
 static volatile _iq FiltIout = 0;
 static volatile _iq FiltIL   = 0;
 static volatile _iq FiltMod  = 0;
+
+// ---- 电流环健康度累加器（每 20ms 清零一次）----
+static volatile _iq    VLPeak   = 0;
+static volatile _iq    IErrPeak = 0;
+static volatile Uint16 ModSatCnt = 0U;
+static volatile Uint16 PiSatCnt  = 0U;
+
+// 这些量在 main.c / pid.c 里定义，检查用
+extern volatile _iq IRef;
+extern volatile _iq IL;
+extern volatile _iq V_L;
+extern volatile _iq Mod;
+extern PI_TypeDef  PI_I;
+extern volatile _iq VinFF;
 
 // 校零实测到的引脚电压（V），只给 OLED 显示 Z: 用
 static float CalPinVout = 0.0f;
@@ -85,6 +100,7 @@ volatile Uint16 Scope_Prescale = 5U;
 // 有效值镜像结构体：OLED 全部数据来源 + Expressions 观察用
 //===========================================================================
 volatile Debug_View_Type Debug_View;
+volatile Debug_Loop_Type Debug_Loop;
 
 /*===========================================================================
  * 函数名：Debug_View_Init
@@ -150,9 +166,49 @@ void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
     {
         _iq ax = (mod >= 0) ? mod : -mod;
 
-        if (ax > ModPk)
-        {
+        if (ax > ModPk)        {
             ModPk = ax;
+        }
+    }
+
+    // ---- 电流环健康度：只做整数比较和取峰值，没有乘除法 ----
+    {
+        _iq av = (V_L >= 0) ? V_L : -V_L;
+
+        if (av > VLPeak)
+        {
+            VLPeak = av;
+        }
+
+        // 调制比贴限幅的采样点
+        _iq am = (mod >= 0) ? mod : -mod;
+
+        if (am >= Mod_Max)
+        {
+            if (ModSatCnt < 0xFFFFU)
+            {
+                ModSatCnt++;
+            }
+        }
+
+        // PI 输出被自身限幅夹住（就是"没有电压余量"的那个时刻）
+        if ((V_L >= PI_I.OutMax) || (V_L <= PI_I.OutMin))
+        {
+            if (PiSatCnt < 0xFFFFU)
+            {
+                PiSatCnt++;
+            }
+        }
+    }
+
+    // 跟踪误差峰值
+    {
+        _iq e  = IRef - IL;
+        _iq ae = (e >= 0) ? e : -e;
+
+        if (ae > IErrPeak)
+        {
+            IErrPeak = ae;
         }
     }
 #else
@@ -243,6 +299,18 @@ void Debug_View_Background(void)
     RmsILSq   = 0;
     AvgVinSum = 0;
     AvgIinSum = 0;
+
+    // ---- 电流环健康度：一个工频周期的统计 ----
+    Debug_Loop.V_L_Amp   = _IQtoF(VLPeak);
+    Debug_Loop.IErr_Amp  = _IQtoF(IErrPeak);
+    Debug_Loop.ModSatPct = (float)ModSatCnt * 100.0f / (float)Rms_Cycle_Samples;
+    Debug_Loop.PiSatPct  = (float)PiSatCnt  * 100.0f / (float)Rms_Cycle_Samples;
+    Debug_Loop.VinFF     = _IQtoF(VinFF);
+
+    VLPeak    = 0;
+    IErrPeak  = 0;
+    ModSatCnt = 0U;
+    PiSatCnt  = 0U;
 #endif
 
     // 校零实测的引脚电压（Adc_ZeroCal 里只算一次，这里搬到 Debug_View 给 OLED 用）
