@@ -55,8 +55,9 @@ extern volatile Debug_View_Type Debug_View;
 //===========================================================================
 typedef struct
 {
-    float V_L_Amp;      // |V_L| 峰值，V —— PI 要了多大的电感压降
-    float IErr_Amp;     // |IRef - IL| 峰值，A —— 跟踪误差
+    float V_L_Amp;      // |V_L| 峰值，V —— 峰值保持，单个毛刺就会顶满，只适合查尖峰
+    float IErr_Amp;     // |IRef - IL| 峰值，A —— 同上，别拿它判断跟得准不准
+    float IErr_Rms;     // (IRef - IL) 的有效值，A —— ★ 看跟踪精度用这个
     float ModSatPct;    // |Mod| >= Mod_Max 的采样点占比，% —— 调制比贴限幅的程度
     float PiSatPct;     // PI 输出被 OutMax/OutMin 限住的占比，% —— 余量耗尽的程度
     float VinFF;        // 滤波后的母线电压，V（InvVin 就是它的倒数）

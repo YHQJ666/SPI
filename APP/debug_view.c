@@ -43,6 +43,7 @@ static volatile _iq FiltMod  = 0;
 // ---- 电流环健康度累加器（每 20ms 清零一次）----
 static volatile _iq    VLPeak   = 0;
 static volatile _iq    IErrPeak = 0;
+static volatile long long IErrSq = 0;
 static volatile Uint16 ModSatCnt = 0U;
 static volatile Uint16 PiSatCnt  = 0U;
 
@@ -201,15 +202,18 @@ void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
         }
     }
 
-    // 跟踪误差峰值
+    // 跟踪误差：峰值（查毛刺）+ 有效值（查跟得准不准）
     {
         _iq e  = IRef - IL;
         _iq ae = (e >= 0) ? e : -e;
+        long xe = (long)(e >> 8);       // Q24 -> Q16 再平方，和下面几个 RMS 同构
 
         if (ae > IErrPeak)
         {
             IErrPeak = ae;
         }
+
+        IErrSq += (long long)xe * (long long)xe;
     }
 #else
     (void)vout; (void)iout; (void)il; (void)vin; (void)iin; (void)mod;
@@ -303,6 +307,7 @@ void Debug_View_Background(void)
     // ---- 电流环健康度：一个工频周期的统计 ----
     Debug_Loop.V_L_Amp   = _IQtoF(VLPeak);
     Debug_Loop.IErr_Amp  = _IQtoF(IErrPeak);
+    Debug_Loop.IErr_Rms  = sqrtf((float)IErrSq / (float)Rms_Cycle_Samples / 4294967296.0f);
     Debug_Loop.ModSatPct = (float)ModSatCnt * 100.0f / (float)Rms_Cycle_Samples;
     Debug_Loop.PiSatPct  = (float)PiSatCnt  * 100.0f / (float)Rms_Cycle_Samples;
     Debug_Loop.VinFF     = _IQtoF(VinFF);
