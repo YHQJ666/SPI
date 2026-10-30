@@ -61,6 +61,7 @@
 #define LOOP_CURR_CLOSED  2
 #define LOOP_DUAL         3
 #define LOOP_FIXED_DUTY   4
+
 #ifndef LOOP_MODE
 #define LOOP_MODE         2
 #endif
@@ -137,7 +138,7 @@
 //   0 = 配 28035_RAM_lnk.cmd（纯 RAM 运行，现在用这个；不掉电就不用重下）
 //   1 = 配 28035_FLASH_lnk.cmd（Flash 运行，main() 里要先把 ramfuncs 搬到 RAM）
 #ifndef SFRA_FLASH_BUILD
-#define SFRA_FLASH_BUILD  0
+#define SFRA_FLASH_BUILD  1
 #endif
 
 // ---- 2. 系统时钟 / 载波 / 采样率 ----
