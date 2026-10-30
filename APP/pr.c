@@ -35,6 +35,11 @@
  */
 
 #include "pr.h"
+// ★ 必须包含 dcac_cfg.h：下面的 #if (LOOP_MODE != LOOP_CURR_CLOSED) 要靠它拿宏。
+//   只 include pr.h 的话两个宏都是未定义标识符、预处理按 0 处理，
+//   于是 (0 != 0) 恒假，PR 在所有模式下都被编掉 —— 表现为
+//   "只有电流单环能链接，mode 1/3 报 _PR_Calc / _PR_Design 未定义"。
+#include "dcac_cfg.h"
 
 // 全局 PR 结构体定义
 PR_TypeDef PR_V;
