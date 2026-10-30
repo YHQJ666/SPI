@@ -238,7 +238,6 @@ void main(void){
     Sfra_Task_Init();
 
     // 保护：只配 TZ 的软件封波通路，不碰 COMP/Digital Compare
-    // ★ 无条件调用：TZCTL 复位值是"强制输出高"，不配的话软件封波会把四管拉高
     Protect_Init();
 
     // 中断向量绑定（只有 ADCINT1；TZ 中断已经不用了）
