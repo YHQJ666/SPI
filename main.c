@@ -127,6 +127,8 @@ volatile _iq  V_L    = 0;                            // PI 输出电压，只给
 
 // 欠压兜底的调制比幅值：0 -> Mod_Max，进入欠压状态时清零重爬（见 dcac_cfg.h 8c）
 volatile _iq  UvRamp = 0;
+// SFRA 扫频用的 0~1 工作点斜坡（RefRamp 是电压峰值 0~50.91，不能当比例用）
+volatile _iq  SfraRamp = 0;
 
 // 输入侧两路采样：只存 ADC 原始码，不参与控制环，后续留给输入过压/过流保护。
 // 换算成工程量（加保护阈值时用）：
@@ -500,6 +502,20 @@ __interrupt void ADC_ISR(void)
             RefRamp = 0;
         }
 
+        // SFRA 工作点的 0~1 斜坡：和 RefRamp 同一个软启动时长
+        if (Run_Enable != 0U)
+        {
+            SfraRamp += Sfra_Ramp_Step;
+            if (SfraRamp > _IQ(1.0f))
+            {
+                SfraRamp = _IQ(1.0f);
+            }
+        }
+        else
+        {
+            SfraRamp = 0;
+        }
+
         // ---- 4. 相位累加 + 查表：phase_step = 256*50/20000 = 0.64 ----
         // PhaseAcc 高 8 位是表下标、低 24 位是 Q24 小数，
         // 与 0xFFFFFFFF 相与即对 256 取模，等价于原来的 Phase -= 256
@@ -509,16 +525,18 @@ __interrupt void ADC_ISR(void)
 
 #if (SFRA_ENABLE == 1) && (LOOP_MODE != LOOP_SINE_OPEN)
         // ---- SFRA 扫频版：参考冻结成直流（单相逆变器的正弦参考没有稳态工作点）----
-        // ★ 必须跟软启动一起走：RefRamp 从 0 斜坡到 Vref_Peak，
-        //   这里按 RefRamp 的比例给出直流工作点。直接赋 20V/0.4 的话，
-        //   复位后第一个中断就把功率级顶起来，绕过了 Run_Enable 和软启动。
+        // ★ 工作点必须跟软启动一起爬（否则复位后第一个中断就把功率级顶起来，
+        //   绕过了 Run_Enable 和软启动）。
+        // ★★ 这里要用 0~1 的斜坡 SfraRamp，**不能**用 RefRamp：
+        //     RefRamp 是"电压峰值"，爬到 Vref_Peak = 50.91，不是 0~1。
+        //     之前拿它当比例乘，工作点变成 1A×50.91 = 50.9A，
+        //     注入的 ±0.3A 随后被 Iref_Max(8A) 限幅整个吃掉，
+        //     SFRA 量到的是纯噪声 —— 表现就是幅频一条平线、相位乱跳 ±180°。
         {
             _iq op = (LOOP_MODE == LOOP_FIXED_DUTY) ? SFRA_DUTY_DC
                    : (LOOP_MODE == LOOP_CURR_CLOSED) ? SFRA_IREF_DC
                    : SFRA_VREF_DC;
-            Vref = _IQmpy(op, RefRamp);         // RefRamp 就是 0~1 的斜坡
-            if (Vref > Vref_Peak)  { Vref = Vref_Peak; }
-            if (Vref < -Vref_Peak) { Vref = -Vref_Peak; }
+            Vref = _IQmpy(op, SfraRamp);        // SfraRamp: 0 -> 1.0
         }
 #endif
 
@@ -538,7 +556,18 @@ __interrupt void ADC_ISR(void)
         PR_V.X1 = 0; PR_V.X2 = 0;
         PR_V.Y1 = 0; PR_V.Y2 = 0;
 #if (SFRA_ENABLE == 1)
-        IRef = SFRA_INJ(Vref);
+        // ★ 先给直流工作点限幅，再注入：顺序反过来（先注入后限幅）的话
+        //   只要工作点接近 Iref_Max，±0.3A 的扰动就会被整个削平，扫出来全是噪声
+        IRef = Vref;
+        if (IRef > Iref_Max)
+        {
+            IRef = Iref_Max;
+        }
+        else if (IRef < -Iref_Max)
+        {
+            IRef = -Iref_Max;
+        }
+        IRef = SFRA_INJ(IRef);
 #else
         // ★ 电流给定 = 安培，不是电压环的 Vref（伏特）。
         //   Vref = sin_val*RefRamp，幅值会爬到 Vref_Peak = 50.91，

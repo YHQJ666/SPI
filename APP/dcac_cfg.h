@@ -63,7 +63,7 @@
 #define LOOP_FIXED_DUTY   4
 
 #ifndef LOOP_MODE
-#define LOOP_MODE         2
+#define LOOP_MODE         4
 #endif
 
 // ---- 功能开关 ----
@@ -72,7 +72,7 @@
 // DEBUG_VIEW_ENABLE: 1 = 额外编译 Debug_View 的镜像字段和示波器缓冲；
 //   0 = 只留 OLED 要用的那几个有效值。中断里两条路都只有一次函数调用/空调用
 #ifndef SFRA_ENABLE
-#define SFRA_ENABLE       0
+#define SFRA_ENABLE       1
 #endif
 #ifndef DEBUG_VIEW_ENABLE
 #define DEBUG_VIEW_ENABLE 0
@@ -84,7 +84,7 @@
 // Ki = 0 就是纯 P：被控对象是 1/(sL)，纯 P 在 50Hz 处 Kp/(wL) 已经足够大
 //   （L ≈ 0.29mH 由 SFRA 实测的 +14.9dB@100Hz 反推，wL = 0.091，
 //     Kp/(wL) ≈ 105，静差约 1%）
-#define KP_I                _IQ(9.6f)     // [V/A] = 旧值 0.16 mod/A × 60V
+#define KP_I                _IQ(10.0f)     // [V/A] = 旧值 0.16 mod/A × 60V
 #define KI_I                0.0f          // [1/s]，0 = 纯 P
 
 // ---- 前馈相关的滤波与钳位 ----
@@ -441,6 +441,13 @@
 #define Soft_Start_Step_F \
     (Vref_Peak_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
 #define Soft_Start_Step _IQ(Soft_Start_Step_F)      // Q24：5.0912e-3 -> 85415
+
+// SFRA 扫频工作点用的 0~1 斜坡步长（同一个软启动时长内从 0 爬到 1.0）
+// ★ 不能拿 RefRamp 代替：RefRamp 是电压峰值，量程 0~Vref_Peak(50.91)，不是 0~1。
+//   拿它当比例乘出来的工作点会大 50 倍，注入量随后被限幅吃掉，扫频全是噪声。
+#define Sfra_Ramp_Step_F \
+    (1.0f / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
+#define Sfra_Ramp_Step _IQ(Sfra_Ramp_Step_F)        // Q24：1e-4 -> 1678
 
 // ---- 8b. 电流单环（LOOP_CURR_CLOSED）给定 ----
 // ★ 单电流环没有电压环兜底，给定必须是"安培"，不能再用电压环的 Vref：
