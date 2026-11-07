@@ -10,9 +10,10 @@
  *   比较值 : cmpA = TBPRD/2 * (1 - m*sinθ)   右桥臂（EPWM1，GPIO0/1）
  *            cmpB = TBPRD/2 * (1 + m*sinθ)   左桥臂（EPWM2，GPIO2/3）
  *            两者之和恒等于 TBPRD
- *   动作   : AQCTLA/AQCTLB 都写成 CAU=CLEAR, CAD=SET
- *            -> 占空 = CMPA/TBPRD，且 B 是 A 的互补
- *            死区子模块 IN_MODE=DBA_ALL / OUT_MODE=FULL / POLSEL=AHC，
+ *   动作   : **AQCTLA** 写 CAU=CLEAR, CAD=SET -> EPWMxA 占空 = CMPA/TBPRD
+ *            **AQCTLB 必须全 0（无动作）**：EPWMxB 由死区子模块从 A 取反生成，
+ *            给 B 再配一套互补动作会和取反叠加两次，结果 B == A（见 epwm.c）
+ *            死区子模块 IN_MODE=0(A 通道作输入) / OUT_MODE=3(FULL) / POLSEL=2(AHC)，
  *            每个桥臂上下管互补并插入 300ns 死区
  *
  * 引脚与占空：
@@ -26,7 +27,10 @@
  *   电平只有 +Vdc / 0 / -Vdc 三种，uAB 每个载波周期出现两个脉冲，
  *   等效开关频率 = 2*fsw = 40kHz，滤波电感电容可以显著减小
  *
- *   m 上限 0.85 -> 基波峰值 0.85*60V = 51V = 36Vrms
+ *   m 的限幅是 Mod_Max（dcac_cfg.h，当前 0.95）。稳态工作点由前馈给出：
+ *     峰值 mod = 50.91/60 = 0.8485，限幅留约 6V 余量给 PI 修正。
+ *     ★ 以前 Mod_Max=0.85 正好等于工作点，余量为 0，
+ *       正弦峰值附近 PI 没有权限，电流被削平 —— 见 dcac_cfg.h 第 3 节
  *
  * GPIO 占用：只占 GPIO0~GPIO3，GPIO4 留给中断计时脚
  *

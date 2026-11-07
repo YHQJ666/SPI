@@ -88,10 +88,10 @@ static void SCIA_GPIO_Init(void)
 void Sfra_Task_Init(void)
 {
     // 注入幅值（Q26，按信号自己的单位）：
-    //   固定占空比  -> 占空比 ±2%
-    //   电流给定    -> ±0.3A
-    //   电压给定    -> ±0.5V
-#if (LOOP_MODE == LOOP_FIXED_DUTY)
+    //   模式 0（固定占空比，量受控体） -> 占空比 ±2%
+    //   模式 2（电流给定）             -> ±0.3A
+    //   模式 1/3（电压给定）           -> ±0.5V
+#if (LOOP_MODE == LOOP_SINE_OPEN)
     SFRA1.amplitude = _IQ26(0.02f);
 #elif (LOOP_MODE == LOOP_CURR_CLOSED)
     SFRA1.amplitude = _IQ26(0.30f);

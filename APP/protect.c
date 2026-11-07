@@ -67,6 +67,11 @@ void Protect_Init(void)
  * 说明：20kHz 中断里每拍调用。Q24 定点比较就是整数比较，不做任何转换
  *       欠压不锁存（电压回来自动恢复），过流锁存
  *===========================================================================*/
+/* ★ 20kHz 中断里每拍调用，必须放 RAM（理由见 pid.c 顶部） */
+#if (SFRA_FLASH_BUILD == 1)
+#pragma CODE_SECTION(Protect_Update, "ramfuncs")
+#endif
+
 void Protect_Update(_iq vin, _iq il)
 {
     // ---- 欠压：进入要连续 UV_Debounce 拍，退出也要连续 UV_Clear_Debounce 拍 ----
@@ -114,7 +119,7 @@ void Protect_Update(_iq vin, _iq il)
     }
 
     // ---- 动作：只在 Protect_Enable==1 时封波 ----
-    // 欠压的动作不在这里：欠压要切固定 0.85 正弦兜底，属于控制环，见 main.c
+    // 欠压的动作不在这里：欠压要切固定 Mod_Max 正弦兜底，属于控制环，见 main.c
 #if (Protect_Enable == 1)
     if (Protect_OcFault != 0U)
     {

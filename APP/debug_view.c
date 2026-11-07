@@ -146,6 +146,13 @@ void Debug_View_SetCalPin(float vo, float io, float il)
  * 说明：20kHz 中断里每拍调用。只做平方累加和取峰值，开方留到后台。
  *       先右移 8 位（Q24 -> Q16）再平方，否则 400 拍会溢出。
  *===========================================================================*/
+/* ★ 这两个都在 20kHz 中断里每拍调用，必须放 RAM（理由见 pid.c 顶部）。
+ *   SFRA 版（SFRA_ENABLE=1）里 IsrUpdate 的函数体被编掉，标这里对两种配置都安全。 */
+#if (SFRA_FLASH_BUILD == 1)
+#pragma CODE_SECTION(Debug_View_IsrUpdate,   "ramfuncs")
+#pragma CODE_SECTION(Debug_View_ScopeSample, "ramfuncs")
+#endif
+
 void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
 {
 #if (SFRA_ENABLE == 0)
@@ -316,6 +323,16 @@ void Debug_View_Background(void)
     IErrPeak  = 0;
     ModSatCnt = 0U;
     PiSatCnt  = 0U;
+
+    // ★★ IErrSq 必须在这里清！漏了的话它跨周期一直累加，
+    //    而上面仍按"一个工频周期（400 拍）"去平均，于是
+    //      IErr_Rms = 真实有效值 × sqrt(已经过了多少个周期)
+    //    表现就是 IErr_Rms 比它自己的峰值 IErr_Amp 还大几十倍，而且一直往上爬。
+    //    （和本函数开头 RMS 那几个累加器是同一类问题，那三个是清的）
+    //    注意：只能清在 Debug_Loop.IErr_Rms 算完之后，清在前面就恒为 0 了。
+    //    64 位读+清和 20kHz 中断里的 += 不是原子的，会丢 1~2 个采样点，
+    //    对有效值统计可以忽略
+    IErrSq = 0;
 #endif
 
     // 校零实测的引脚电压（Adc_ZeroCal 里只算一次，这里搬到 Debug_View 给 OLED 用）

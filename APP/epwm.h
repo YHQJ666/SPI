@@ -5,6 +5,8 @@
 
 // 1. GPIO初始化函数声明
 void InitEPwmGpioAll(void);
+// 只把 GPIO0~GPIO3 复用成 EPWM1A/1B、EPWM2A/2B（spwm.c 用这个，不是上面那个全量版）
+void InitPwmBridgeGpio(void);
 
 // 2. EPWM初始化函数声明
 // 主模块（EPWM1）：无相位偏移参数

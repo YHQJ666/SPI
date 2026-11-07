@@ -61,10 +61,15 @@
 #define SFRA_SCI_LSPCLK     15000000L   /* LSPCLK = SYSCLK/2 = 15MHz */
 #define SFRA_SCI_BAUDRATE   57600L      /* SFRA GUI 默认 */
 
-/* ---- 扫频工作点（参考冻结，不走 50Hz 正弦） ---- */
-#define SFRA_VREF_DC        _IQ(20.0f)  /* 电压环扫频：输出电压直流给定 20V */
-#define SFRA_DUTY_DC        _IQ(0.40f)  /* Plant 扫频：固定占空比 0.4 */
-#define SFRA_IREF_DC        _IQ(1.0f)   /* 电流环扫频：直流电流给定 1A */
+/* ---- 扫频工作点（参考冻结成直流，不走 50Hz 正弦）----
+ * ★ SFRA_ENABLE=1 时四种环路模式全部用直流工作点，见 dcac_cfg.h 的"环路模式"
+ *   SFRA_DUTY_DC  给模式 0（注入占空比，采 Mod->IL = 受控体本身）
+ *   SFRA_IREF_DC  给模式 2（电流单环）
+ *   SFRA_VREF_DC  给模式 1/3（含电压环）
+ */
+#define SFRA_VREF_DC        _IQ(20.0f)  /* 模式 1/3：输出电压直流给定 20V */
+#define SFRA_DUTY_DC        _IQ(0.40f)  /* 模式 0：固定占空比 0.4（量受控体） */
+#define SFRA_IREF_DC        _IQ(1.0f)   /* 模式 2：直流电流给定 1A */
 
 /* ---- 库对象与结果数组 ---- */
 extern SFRA_IQ  SFRA1;

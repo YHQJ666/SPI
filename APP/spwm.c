@@ -9,7 +9,7 @@
  * 载波：TBCLK = SYSCLK = 60MHz，TBPRD = 1500
  *       fsw = 60MHz / (2*1500) = 20kHz
  * ADC：EPWM1 在 CTR=ZERO 触发 SOCA
- *      SOC0 丢弃 SOC1=ADCA0 输出电流 SOC2=ADCA1 输出电压 SOC3=ADCA2 电感电流
+ *      SOC0 丢弃  SOC1=ADCA0 输出电压  SOC2=ADCA1 输出电流  SOC3=ADCA2 电感电流
  *      SOC4=ADCB1 输入电压 SOC5=ADCB0 输入电流（后两路只监视）
  *      EOC5 -> ADCINT1 -> CPU 的 ADC 中断（控制环在中断里跑）
  *
@@ -33,6 +33,13 @@
 #define SPWM_TBPRD      (TBPRD)
 #define SPWM_CMPA_MID   (CMPA_Mid)
 #define SPWM_CMPA_SPAN  (CMPA_Span)
+
+/* ★ SPWM_SetMod 在 20kHz 中断里每拍调用；它内部调用的 SPWM_ModToCmp 是静态函数，
+ *   只标外面那个不够 —— 两个都要放 RAM（理由见 pid.c 顶部）。 */
+#if (SFRA_FLASH_BUILD == 1)
+#pragma CODE_SECTION(SPWM_ModToCmp, "ramfuncs")
+#pragma CODE_SECTION(SPWM_SetMod,   "ramfuncs")
+#endif
 
 /*===========================================================================
  * 函数名：SPWM_ModToCmp
@@ -104,9 +111,24 @@ void SPWM_Init(void)
     PieCtrlRegs.PIEIER3.bit.INTx1 = 0;
     IER &= (Uint16)(~M_INT3);
 
-    // ADC 触发：EPWM1 在 CTR=ZERO 发 SOCA，每个载波周期一次
-    // CTR=ZERO 正好在开关管导通区间正中（开关沿在 +-CMPA 处），
-    // 此刻电感电流等于其平均值，采样值不含开关纹波，是最佳采样时刻
+    // ADC 触发：EPWM1 在 CTR=ZERO（计数器底点）发 SOCA，每个载波周期一次
+    //
+    // 为什么底点就是"电感电流平均值"点（推导留在这里，别再来回改）：
+    //   1) AQCTLA 是 CAU=CLEAR / CAD=SET -> EPWMxA 在 CTR < CMPA 时为高，
+    //      高电平窗口以 CTR=ZERO 为中心，占空 d = CMPA/TBPRD
+    //   2) 两桥臂 CMPA = TBPRD/2*(1 -+ mod) -> d1 + d2 = 1，
+    //      于是 uAB = (d2-d1)*Vdc 的周期是 TBPRD（40kHz），且关于 CTR=0 偶对称
+    //   3) uAB = 0 的区间是 |CTR| < CMPA1，**以 CTR=0 为中心**；
+    //      电流在这一段里线性下降（d1+d2=1 保证升降斜率对称），
+    //      下降段的中点值 = (max+min)/2 = 一个纹波周期的平均值
+    //   => CTR=ZERO 处的瞬时 i_L 就等于平均值。
+    //   ★ 同理 CTR=TBPRD(顶点) 和 CTR=TBPRD/2 也都是平均值点，选哪个都行，
+    //     所以 SOCASEL 不需要改。
+    //
+    // ⚠ 真正会偏的是"排在哪个 SOC"：6 路 SOC 是串行转换的，
+    //   第 N 个 SOC 的实际采样时刻比 CTR=0 晚 (N-1)*每通道转换时间。
+    //   i_L 现在排在 SOC3（第 4 个），比 Vout/Iout 更靠后，
+    //   而它才是对纹波最敏感的那一路 —— 建议把它换到 SOC0/SOC1 那一对（见 main.c）。
     EPwm1Regs.ETSEL.bit.SOCAEN  = 1;
     EPwm1Regs.ETSEL.bit.SOCASEL = ET_CTR_ZERO;
     EPwm1Regs.ETPS.bit.SOCAPRD  = ET_1ST;

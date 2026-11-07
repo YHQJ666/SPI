@@ -5,15 +5,18 @@
  *
  * 载波：ePWM1 增减计数 TBPRD=1500 -> fsw=20kHz
  * 采样：ePWM1 在 CTR=ZERO 触发 SOCA，ADCINT1 直接进 CPU 中断
- *   SOC0 丢弃
- *   SOC1 = ADCINA0 输出电流 i_o
- *   SOC2 = ADCINA1 输出电压 v_o
+ *   SOC0 丢弃（与 SOC1 同通道，修 rev0 首采样 errata）
+ *   SOC1 = ADCINA0 输出电压 v_o
+ *   SOC2 = ADCINA1 输出电流 i_o
  *   SOC3 = ADCINA2 电感电流 i_L
  *   SOC4 = ADCB1 输入电压 v_in（分压 80/3.3，只监视/保护）
  *   SOC5 = ADCB0 输入电流 i_in（放大 150 倍，只监视/保护）
- *   控制环只吃 i_o / v_o / i_L，输入侧两路只做监视/保护（见 5.4 / 5.5）
- * 控制：电容电流 i_c = i_L - i_o
- *   电压外环 PR(准比例谐振) -> 电容电流给定 -> 电流内环 PI -> 调制比 mod
+ *   控制环只吃 v_o / i_o / i_L，输入侧两路只做监视/保护（见 5.4 / 5.5）
+ * 控制（LOOP_MODE=2，当前配置）：
+ *   电流单环，反馈取**电感电流 i_L**（不是电容电流 i_c = i_L - i_o），
+ *   PI 输出 V_L（电感压降给定，单位 V），再和前馈合成调制比：
+ *     mod = (V_L + v_o) / v_in
+ * LOOP_MODE=3（双环）才是 电压外环 PR -> 电感电流给定 -> 电流内环 PI。
  *
  *
  * ============================ 定点化说明 ============================
@@ -21,7 +24,7 @@
  *   Q24 分辨率 2^-24 = 5.96e-8，动态范围只有 ±128
  *   本工程所有运行量都在 ±128 以内：
  *     输出电压 80V、输出电流 22A、电感电流 30A、给定峰值 50.9V、
- *     电容电流给定 8A、调制比 0.85
+ *     电流环给定峰值 8A、调制比 0.95（限幅）
  *   超过 ±128 的量必须换低 Q 存放，整个工程只有下面 3 处，都加了注释：
  *     a) 谐振角频率 w0 = 314  -> 设计期就折成 R_V = w0*Ts/2 = 0.00785，不再有 w0
  *     b) TBPRD/2 = 750        -> SPWM 里按 Q15 算比较值
@@ -49,21 +52,31 @@
 
 //===========================================================================
 //                         ★★★ 常 改 区 ★★★
-//  平时要动的基本只有这一段。下面的内容是标定、中断、RMS 之类的实现细节，
-//  改之前先翻到对应小节看注释。
 //===========================================================================
 
 // ---- 环路模式 ----
-// 0 正弦开环 + 软启动 / 1 电压单环 / 2 电流单环 / 3 电压+电流双环 / 4 固定占空比开环
+// 0 正弦开环 + 软启动 / 1 电压单环 / 2 电流单环 / 3 电压+电流双环
+//
+// ★★ SFRA_ENABLE = 1 时，上面**四种模式全部**把参考冻结成直流工作点
+//    （对应 TI 例程的 DC_CHECK=1）：正弦参考没有稳态工作点，环路一直在追一个
+//    移动目标，输出里巨大的工频基波会把 SFRA 注入的小扰动完全淹没，
+//    扫出来就是一条平线 + 相位乱跳。
+//    冻结之后各模式的工作点：
+//      模式 0  -> SFRA_DUTY_DC  固定占空比；注入点在占空比，采 Mod->IL，
+//                                量到的就是**受控体本身**（TI 的 BUILD1+DC_CHECK）
+//      模式 2  -> SFRA_IREF_DC  直流电流给定
+//      模式 1/3-> SFRA_VREF_DC  直流电压给定
+// ★ 原来的"4 固定占空比开环"已删除，它的"量受控体"功能合进模式 0。
+//   这样 4 种模式就够覆盖全部扫频需求。
+//
 // 允许 build configuration 用 -dLOOP_MODE=n 覆盖（必须 #ifndef 包住，否则头文件赢）
 #define LOOP_SINE_OPEN    0
 #define LOOP_VOLT_CLOSED  1
 #define LOOP_CURR_CLOSED  2
 #define LOOP_DUAL         3
-#define LOOP_FIXED_DUTY   4
 
 #ifndef LOOP_MODE
-#define LOOP_MODE         4
+#define LOOP_MODE         2
 #endif
 
 // ---- 功能开关 ----
@@ -72,20 +85,49 @@
 // DEBUG_VIEW_ENABLE: 1 = 额外编译 Debug_View 的镜像字段和示波器缓冲；
 //   0 = 只留 OLED 要用的那几个有效值。中断里两条路都只有一次函数调用/空调用
 #ifndef SFRA_ENABLE
-#define SFRA_ENABLE       1
+#define SFRA_ENABLE       0
 #endif
 #ifndef DEBUG_VIEW_ENABLE
 #define DEBUG_VIEW_ENABLE 0
 #endif
 
 // ---- 电流环 PI（LOOP_CURR_CLOSED）----
-// ★ 量纲随 Task 5（前馈）一起改：现在 PI 输出直接当调制比，所以是 mod/A；
-//   加上前馈之后 PI 输出变成"电压"，这一对要改成 9.6 V/A（× Vbus 60V）。
-// Ki = 0 就是纯 P：被控对象是 1/(sL)，纯 P 在 50Hz 处 Kp/(wL) 已经足够大
-//   （L ≈ 0.29mH 由 SFRA 实测的 +14.9dB@100Hz 反推，wL = 0.091，
-//     Kp/(wL) ≈ 105，静差约 1%）
-#define KP_I                _IQ(10.0f)     // [V/A] = 旧值 0.16 mod/A × 60V
-#define KI_I                0.0f          // [1/s]，0 = 纯 P
+#define KP_I                _IQ(10.0f)          // [V/A]
+// ★ 积分增益不再用 Q24 存"Ki 本身"，改成直接存 KiTs = Ki*Ts（也是 Q24）。
+//   原因：Q24 的 ±128 会把 Ki 卡死在 128 1/s 上不去，而 KiTs = Ki*50us 很小
+//   （Ki=10000 时也才 0.5），Q24 完全装得下。
+//   于是上限从 "Ki <= 128" 变成 "KiTs <= 128"，即 Ki <= 128/Ts = 2.56e6 1/s。
+#define KI_I              100000.0f              // [1/s] 积分增益，想给多大给多大
+#define KI_I_Ts             _IQ(KI_I * Ts_S)  // = Ki*Ts，Q24，中断里真正用的就是它
+
+// ---- 6. 控制环参数（待整定） ----
+#define W0_V_F          314.159265f     // 电压环 2*pi*50 谐振角频率
+#define Wc_V_F          10.0f           // 电压环准 PR 截止角频率
+// PR 的 Tustin 系数只需要下面两个无量纲小量，设计期一次算好：
+//   R_V = w0*Ts/2 = 314.159*50us/2 = 7.853982e-3  Q24 -> 131767
+//   Q_V = wc*Ts/2 = 10*50us/2      = 2.5e-4       Q24 -> 4194
+// w0 = 314 本身超出 Q24 的 ±128，做成 Q8 再乘会有精度损失，
+// 直接用编译期常量 _IQ(公式) 算，结果是 Q24 能表示的最接近值
+#define R_V             _IQ(W0_V_F * Ts_S * 0.5f)
+#define Q_V             _IQ(Wc_V_F * Ts_S * 0.5f)
+
+#define KP_V            _IQ(0.001f)    // 电压环比例
+#define KR_V            _IQ(0.00718f)    // 电压环谐振增益（=0 时退化成纯 P）0.0823
+// ---- 电压环积分 [1/s] ----
+// ★ 不用宏切换 PI/PR，三种形态全靠取 0：
+//     KI_V = 0     -> 纯 PR（默认，行为和以前一模一样）
+//     KR_V = 0     -> 纯 PI（配 KI_V != 0）
+//     两个都给      -> PI + PR
+#define KI_V            _IQ(0.0f)
+// ---- 电流环 PI 的固定限幅（替代原来的"动态余量限幅"）----
+// 补偿器自己的边界给 1.0 pu of Vbus，和 TI 例程同一个比例
+//   （TI: CNTL_INV_I_3P3Z_MAX = 1.0 pu，其 pu 基准 620V -> 等于 ±620V）
+// 真正的限幅在末级 Mod_Max；这里只负责"别让积分器跑到天文数字"。
+// 相比原来那套 ±Mod_Max*Vin ∓ Vout 的动态限幅：不用每拍按 Vout 重算、
+// 不可能出现 OutMax < OutMin 的乱序边界，代价是母线跌落时抗饱和略差。
+// Q24 检查：V_L_Max + |Vout|max = 60 + 57.7 = 117.7 < 128 ✓ 不会溢出
+#define V_L_Max_F           60.0f
+#define V_L_Max             _IQ(V_L_Max_F)
 
 // ---- 前馈相关的滤波与钳位 ----
 // VoutFF / VinFF 都是一阶 IIR：y += (x - y) >> Vff_Shift
@@ -103,8 +145,10 @@
 // ---- 双环 PI（LOOP_DUAL）----
 // 双环那条路的 PI 输出直接当调制比用，量纲还是 mod/A，所以要单独一套，
 // 不能和上面的 V/A 混用（混了会把双环增益静默放大 60 倍）
-#define KP_I3               _IQ(0.16f)    // [mod/A]
-#define KI_I3               0.0f
+// ★ 这两个和 KP_I/KI_I 一样必须是 Q24 整数：KI_I3 写成裸 float 的话，
+//   KI_I3_Ts 的定标方式就跟 KI_I 不一样了（见第 6 节），两边会静默错位
+#define KP_I3               _IQ(0.0f)    // [mod/A]
+#define KI_I3               _IQ(0.0f)     // [1/s]，0 = 纯 P
 
 // ---- 保护 ----
 // 纯软件判断，硬件保护（COMP/DAC/Digital Compare）已经删掉
@@ -113,7 +157,7 @@
 #define UV_Debounce         200U          // 欠压去抖拍数（200 拍 @20kHz = 10ms）
 #define OC_Debounce         3U            // 过流去抖拍数
 // 0 = 只判断、只置标志，不影响输出（当前）
-// 1 = 欠压切固定 0.85 正弦兜底，过流封波锁存
+// 1 = 欠压切固定 Mod_Max 正弦兜底，过流封波锁存
 #ifndef Protect_Enable
 #define Protect_Enable      0
 #endif
@@ -167,18 +211,30 @@
 // ---- 3. 输出规格 / 正弦表 / 相位步进 ----
 // 输入 60V，输出 36Vrms/50Hz
 //   Vref_Peak = sqrt(2)*36 = 50.91V
-//   Mod_Max   = 50.91 / 60 = 0.85
 #define Vbus_Nominal    60.0f
 #define Fout_Hz         50.0f
 #define Vout_Rms        36.0f
 #define Vref_Peak_F     (1.41421356f * Vout_Rms)    // 50.91V，设计期
-#define Mod_Max_F       0.85f
-// 开环目标调制比幅值 = Vref_Peak / Vbus = 0.85
-#define Mod_Amp_Open_F  (Vref_Peak_F / Vbus_Nominal)
+//
+// ★ Mod_Max 是"限幅上限"，不是工作点。工作点由前馈决定：
+//     稳态 mod = v_o/v_in，正弦峰值处 = 50.91/60 = 0.8485
+//   Mod_Max 必须比它大一截，否则正弦峰值附近电流环没有权限去修正 ——
+//   死区压降(约0.4V)、器件压降(2~3V)、母线纹波、v_o 采样误差都比这点余量大，
+//   结果就是峰值附近 PI 被限死、电流被削平。
+//   当前 0.95 -> 峰值处余量 0.95*60-50.91 = 6.1V，够用。
+//   ★ 不要靠继续抬 Mod_Max 来要余量：mod 越大最小脉宽越窄，
+//     mod=0.95 时最短脉冲只有 750*(1-0.95)=37 个 TBCLK 计数 ≈ 0.62us，
+//     而死区就占 18 个计数(300ns)，窄脉冲畸变会非常重。
+//     真要更大余量应该动工作点：
+//       a) 母线抬到 72V：mod = 50.91/72 = 0.707，余量约 17%
+//       b) 输出降到 30Vrms：mod = 42.43/60 = 0.707，同上
+#define Mod_Max_F       0.95f
+// 开环目标调制比幅值 = Vref_Peak / Vbus = 0.8485（只给 LOOP_SINE_OPEN 用，与限幅无关）
+#define Mod_Amp_Open_F  (Vref_P eak_F / Vbus_Nominal)
 
 #define Vref_Peak       _IQ(Vref_Peak_F)        // Q24：50.91V -> 854156389
-#define Mod_Max         _IQ(Mod_Max_F)          // Q24：0.85
-#define Mod_Amp_Open    _IQ(Mod_Amp_Open_F)     // Q24：0.85
+#define Mod_Max         _IQ(Mod_Max_F)          // Q24：0.95
+#define Mod_Amp_Open    _IQ(Mod_Amp_Open_F)     // Q24：0.8485
 
 #define Sin_Table_Size  256U
 // phase_step = 256 * Fout / Fsw = 256*50/20000 = 0.64
@@ -256,7 +312,7 @@
 // ---- 5.2 输出电压 v_o（ADCA0）----
 // 偏置 1.5V + 分压。Vpin = 1.5 + K*V，改 K 就改了量程
 #define ADC_Vout_Vzero      1.5f
-#define ADC_Vout_K          0.026f    //
+#define ADC_Vout_K          0.025555f    //
 
 // ---- 5.3 电感电流 i_L（ADCA2）----
 // 和输出电流调理一样：1mΩ + 20 倍
@@ -328,22 +384,23 @@
 #define ADC_Iin_Max         ADC_MaxOf(ADC_Iin_Vzero, ADC_Iin_K)
 
 // ---- 当前参数下编译器会算出这些值（对照用，改完 K/Vzero 后自己核一下）----
-//   通道     Vzero     K     零点码      全跨度                  可测范围                  1码分辨率
-//   Vout  1.5V    0.027   1862    122.22V   -55.56V ~ +66.66V    29.84mV
-//   Iout  2.5V    0.02    3103    165.00A   -125.0A ~ +40.00A    40.28mA
-//   IL    2.5V    0.02    3103    165.00A   -125.0A ~ +40.00A    40.28mA
-//   Vin   0V      3.3/80  0       80.00V      0.00V ~ +80.00V    19.53mV
-//   Iin   0V      0.15    0       22.00A      0.00A ~ +22.00A     5.37mA
+//   通道   Vzero      K       零点码  全跨度    可测范围             1码分辨率
+//   Vout   1.5V      0.0260    1862   126.92V  -57.70V ~ +69.22V   30.99mV
+//   Iout   2.409V    0.0177    2990   186.44A  -136.1A ~ +50.34A   45.52mA
+//   IL     2.431V    0.0177    3018   186.44A  -137.3A ~ +49.07A   45.52mA
+//   Vin    0V        3.3/80       0    80.00V    0.00V ~ +80.00V   19.53mV
+//   Iin    0V        0.1500       0    22.00A    0.00A ~ +22.00A    5.37mA
 //
-//   对比：Vout 原来 K=0.03125 时
-//         全跨度 105.60V，可测 -48.00V ~ +57.60V，分辨率 25.78mV
+//   ★ Iout/IL 用的是实测偏置 2.409V / 2.431V，不是标称 2.5V。
+//     按 2.5V 算，零点码会差 100 多码（≈ 4.5A / 3.5A）：
+//     校零被一致性检查挡掉时，就靠这里必须填对才准。
 //   K 变小 -> 全跨度和可测范围都变大，但分辨率变粗
-//
 //   无偏置的两路（Vin/Iin）零点码为 0，范围就是 0 ~ 全跨度，不存在不对称
 
 // ---- 5b. ADC 零点校准（软件校零） ----
 // 上面那组 Offset 是"标称值"，由各路的 Vzero 偏置算出来（Vout 1.5V、
-// Iout/IL 2.5V、Vin/Iin 无偏置为 0）。实际板子元件有误差和温漂，
+// Iout 2.409V、IL 2.431V（这两个是实测值，不是 2.5V）、Vin/Iin 无偏置为 0）。
+// 实际板子元件有误差和温漂，
 // 真零点会偏几十个码。校零做的事：让各路调理电路处于静止零输入，
 // 把这几十/几百拍的 ADC 码值平均出来，当成真正的零点码。
 // 启用条件：校零的那一下，各路输入必须真的是零
@@ -400,30 +457,24 @@
 // 后面加保护阈值时，既可以直接比码值（省一次乘法），也可以按上面公式算成
 // Q24 再和 _IQ(阈值) 比
 
-// ---- 6. 控制环参数（待整定） ----
-#define W0_V_F          314.159265f     // 电压环 2*pi*50 谐振角频率
-#define Wc_V_F          18.0f           // 电压环准 PR 截止角频率
-// PR 的 Tustin 系数只需要下面两个无量纲小量，设计期一次算好：
-//   R_V = w0*Ts/2 = 314.159*50us/2 = 7.853982e-3  Q24 -> 131767
-//   Q_V = wc*Ts/2 = 10*50us/2      = 2.5e-4       Q24 -> 4194
-// w0 = 314 本身超出 Q24 的 ±128，做成 Q8 再乘会有精度损失，
-// 直接用编译期常量 _IQ(公式) 算，结果是 Q24 能表示的最接近值
-#define R_V             _IQ(W0_V_F * Ts_S * 0.5f)
-#define Q_V             _IQ(Wc_V_F * Ts_S * 0.5f)
 
-#define KP_V            _IQ(0.0518f)    // 电压环比例
-#define KR_V            _IQ(0.0823f)    // 电压环谐振增益
 
 // KP_I / KI_I / KP_I3 / KI_I3 的定义在顶部常改区。
-// 注意量纲：KP_I/KI_I 是 mode 2（前馈结构）用的 V/A，KP_I3/KI_I3 是 mode 3 用的 mod/A。
+// 注意量纲：KP_I 是 mode 2（前馈结构）用的 V/A，KP_I3 是 mode 3 用的 mod/A。
 // 积分增益把采样周期折进去：KI_I_Ts = KI_I*Ts，中断里只乘一次。
 // 这样做一是快，二是保精度：Ts = 50us 在 Q24 里只有 838 个刻度
 // （0.1% 量化误差），先乘 Ts 会把误差的有效位数吃掉十几位。
-// 折进来以后 KI_I_Ts = KI_I*50us，量级很小，Q24 的 6e-8 分辨率完全够用
-#define KI_I_Ts         _IQ(KI_I  * Ts_S)
-#define KI_I3_Ts        _IQ(KI_I3 * Ts_S)
+//
+// ★★ 定标必须写成下面这样，**不能**写成 _IQ(KI_I * Ts_S)：
+//   KI_I 本身已经是 Q24 整数（_IQ(1.0f) = 16777216），再乘 Ts 得到的是一位
+//   "已经乘过 2^24"的数；套上 _IQ() 等于又乘一次 2^24，直接 int32 溢出。
+//   正确做法是让浮点乘法自己完成定标：
+//     KI_IQ24 * Ts = (Ki*2^24)*Ts = KiTs_Q24   <- 正好就是要存的值
+//   KI_I = 0 时两种写法都得 0，所以这个坑一直没暴露；一加积分就会炸。
+#define KI_I_Ts         ((_iq)((float)(KI_I)  * Ts_S))
+#define KI_I3_Ts        ((_iq)((float)(KI_I3) * Ts_S))
 
-#define Iref_Max_F      8.0f            // 电容电流给定限幅 A
+#define Iref_Max_F      8.0f            // 电感电流给定限幅 A（IRamp 峰值 5.883A 留余量）
 #define Iref_Max        _IQ(Iref_Max_F)
 
 // ---- 7. 保护总开关 ----
@@ -467,11 +518,14 @@
 #define Iref_Ref_Step       _IQ(Iref_Ref_Step_F)        // Q24：5.883e-4 -> 9870
 
 // ---- 8c. 欠压兜底（Protect_Enable=1 且 Vin < UV_Volts 时） ----
-// 动作：切到 50Hz 正弦、幅值 0.85 的固定调制比（开环兜底），
+// 动作：切到 50Hz 正弦、幅值 = Mod_Max 的固定调制比（开环兜底），
 //       幅值走自己的斜坡 UvRamp 从 0 爬到 Mod_Max，
-//       每次进入欠压状态时清零重爬，避免把 0.85 全幅一步打进 LC。
-// 注意是"正弦幅值 0.85"，不是"调制比恒等于 0.85"——后者是直流，
+//       每次进入欠压状态时清零重爬，避免把满幅一步打进 LC。
+//       注意 Mod_Max 是那个"限幅上限"（现在 0.95），不是工作点 0.8485：
+//       欠压时本来就没有余量，直接打满更容易接受。
+// 注意是"正弦幅值 Mod_Max"，不是"调制比恒等于 Mod_Max"——后者是直流，
 //       会把电感单向充起来。
+// ★ 现在 Protect_Enable = 0，这一段是死代码；改 Mod_Max 时行为会跟着变
 #define Uv_Ref_Step_F \
     (Mod_Max_F / ((float)Soft_Start_Ms * 0.001f * Fsw_Hz))
 #define Uv_Ref_Step         _IQ(Uv_Ref_Step_F)          // Q24：8.5e-5 -> 1426（10000 拍 = 500ms）
@@ -480,7 +534,7 @@
 // GPIO5 配成普通 GPIO 输出，进 ADC 中断拉高、退出前拉低
 // 用它判断两件事：有没有脉冲 = ADC 中断在不在跑；脉宽 = 控制环耗时
 // 定点化以后控制环应该明显快于原来的软件浮点版本，可以直接用脉宽对比
-#define ISR_Test_Pin    5U      // ★ 实际用的是 GPIO5（GPIO4 上看不到脉冲，已换）
+#define ISR_Test_Pin    5U      // ★ 实际用的是 GPIO5
 
 // ---- 10. 调试器观察用浮点镜像 ----
 // 控制量都是 Q24，调试器里显示的是原始整数（真值 = 原始整数 / 16777216），
