@@ -255,7 +255,7 @@ void main(void){
     // 因此初始化阶段也全是定点运算
     // ★ 电流单环不需要 PR，pr.c 里整个函数都编掉了，这里也要跟着不调用
 #if (LOOP_MODE != LOOP_CURR_CLOSED)
-    PR_Design(&PR_V, KP_V, KR_V, KI_V,
+    PR_Design(&PR_V, KP_V, KR_V, KI_V_Ts,
               R_V, Q_V);
 #endif
     PR_V.Ref = 0;
@@ -268,28 +268,20 @@ void main(void){
     PR_V.OutMax =  Mod_Max;
 
     // 初始化 PI_I
-    // ★ 量纲随模式不同：
-    //   LOOP_CURR_CLOSED：前馈结构，PI 输出是电压（V）。
-    //     下面给的 ±51V 只是上电初值，ISR 每拍会按真实电压余量重设
-    //     （而且是**不对称**的区间，见 ADC_ISR 里的动态限幅）
-    //   其它模式        ：PI 输出直接当调制比，限幅 ±Mod_Max
+    // ★ 两个用内环的模式（LOOP_CURR_CLOSED / LOOP_DUAL）现在都是前馈结构，
+    //   PI 输出都是"电压"，所以共用同一组 KP_I / KI_I 和同一个 ±V_L_Max 限幅。
+    //   其它模式不调用 PI_Calc，这里的值对它们没有意义。
     PI_I.Ref = 0;
     PI_I.Fdb = 0;
     PI_I.Integral = 0;
     // ★ 误差前置限幅：p_term = Kp*err 必须留在 Q24 的 ±128 内。
-    //   Kp=11.74 时上限只有 10.9A，而过流阈值是 12A —— 那一段既没保护、又会
-    //   把 p_term 算翻符号（+128 -> -128），PI 反向打，现场就是"跑飞"。
-    //   取 Iref_Max(8A)，留 30% 余量。
+    //   Kp 越大上限越低，超过就会把 p_term 算翻符号（+128 -> -128），
+    //   PI 反向打，现场就是"跑飞"。取 Iref_Max(8A)，留余量。
     PI_I.ErrMax = Iref_Max;
-#if (LOOP_MODE == LOOP_CURR_CLOSED)
+
     PI_I.Kp     = KP_I;                 // V/A
     PI_I.KiTs   = KI_I_Ts;
     PI_SetLimits(&PI_I, -V_L_Max, V_L_Max);   // 固定宽限幅（1.0 pu of Vbus），一行
-#else
-    PI_I.Kp     = KP_I3;                // mod/A
-    PI_I.KiTs   = KI_I3_Ts;
-    PI_SetLimits(&PI_I, -Mod_Max, Mod_Max);   // mod/A，直接限调制比，一行
-#endif
 
     // ---- CpuTimer0 配成自由运行的周期计数器，给 ADC_ISR 量耗时 ----
     //   PRD 拉满 -> 从 0xFFFFFFFF 往下数，60MHz 下 71.6s 才绕回，够用
@@ -343,24 +335,24 @@ void main(void){
         }
 #endif
 
-//        // 复位故障：把 FaultClear 置 1（调试器或以后加的通信）
-//        if (FaultClear != 0U)
-//        {
-//            FaultClear = 0U;
-//            Protect_Clear();            // 清过流锁存 + 清 TZ 触发
-//            FaultLatch = FAULT_NONE;
-//#if (Protect_Enable == 1)
-//            faultHandled = 0U;
-//#endif
-//
-//            // 清两个环的历史，重新软启动
-//            PR_Reset(&PR_V);
-//            PI_I.Integral = 0;
-//            RefRamp = 0;
-//            IRamp   = 0;
-//            UvRamp  = 0;
-//            PhaseAcc = 0U;
-//        }
+        // 复位故障：把 FaultClear 置 1（调试器或以后加的通信）
+        if (FaultClear != 0U)
+        {
+            FaultClear = 0U;
+            Protect_Clear();            // 清过流锁存 + 清 TZ 触发
+            FaultLatch = FAULT_NONE;
+#if (Protect_Enable == 1)
+            faultHandled = 0U;
+#endif
+
+            // 清两个环的历史，重新软启动
+            PR_Reset(&PR_V);
+            PI_I.Integral = 0;
+            RefRamp = 0;
+            IRamp   = 0;
+            UvRamp  = 0;
+            PhaseAcc = 0U;
+        }
 
         // OLED 刷新：函数内部自己按 500ms 节流，所以每圈都可以调
         // 刷一屏要几十毫秒（I2C 位带，没有硬件外设），所以不能刷太快
@@ -429,7 +421,7 @@ __interrupt void ADC_ISR(void)
     // 用 ADC_To_IQ_Cal：零点码用实测校零结果（主程序启动时测出来的），
     // 没校准或该校通道被一致性检查挡掉时 OffsetNeg = 0，
     // 此时它和 ADC_To_IQ(标称零点码) 完全等价
-    Vout = ADC_To_IQ_Cal(AdcResult.ADCRESULT1, ADC_Vout_Offset, VoutOffNeg, ADC_Vout_Span);
+    Vout = -ADC_To_IQ_Cal(AdcResult.ADCRESULT1, ADC_Vout_Offset, VoutOffNeg, ADC_Vout_Span);
     Iout = ADC_To_IQ_Cal(AdcResult.ADCRESULT2, ADC_Iout_Offset, IoutOffNeg, ADC_Iout_Span);
     IL   = ADC_To_IQ_Cal(AdcResult.ADCRESULT3, ADC_IL_Offset,   ILOffNeg,   ADC_IL_Span);
 
@@ -602,6 +594,10 @@ __interrupt void ADC_ISR(void)
         VoutFF += (Vout - VoutFF) >> Vff_Shift;
         VinFF  += (Vin  - VinFF)  >> Vff_Shift;
 
+        // 滤波器幅度监视：取 |VoutFF| / |VinFF| 峰值，只给 OLED 看
+        //   （必须放在上面两行 IIR 之后，否则拿到的是上一拍的滤波结果）
+        Debug_View_IsrFf(VoutFF, VinFF);
+
         // ---- 限幅：固定宽限幅（TI 风格），一行 ----
         // 补偿器自己的边界给 1.0 pu of Vbus（V_L_Max = 60V），真正的限幅交给末级 Mod_Max。
         // 好处：不用每拍按 Vout 重算，也不可能出现 OutMax < OutMin 的乱序边界。
@@ -661,17 +657,30 @@ __interrupt void ADC_ISR(void)
 
 #elif (LOOP_MODE == LOOP_DUAL)
         // ---- 双环：PR 给电流给定，PI 给调制比 ----
+        // ★ 内环和 LOOP_CURR_CLOSED 用同一套前馈结构：
+        //   纯比例的内环本身没有能力建立 51V 的直流工作点，加前馈之后
+        //   PI 只负责 L*di/dt（约 0.5V），母线跌落由 1/Vin 立刻补偿，
+        //   外层 PR 的负担和输出对母线的敏感度都明显下降。
 #if (SFRA_ENABLE == 1)
         PR_V.Ref = SFRA_INJ(Vref);
 #else
         PR_V.Ref = Vref;
 #endif
         PR_V.Fdb = Vout;
-        IRef = PR_Calc(&PR_V);              // PR 的输出 = 电流环给定 = 受控体输入
+        IRef = PR_Calc(&PR_V);              // PR 的输出 = 电流环给定
+        // ★ PR 谐振起来时给定可能冲得很高，这里必须限（原来 mode 3 没限）
+        IRef = PI_CLAMP(IRef, -Iref_Max, Iref_Max);
+
+        // 前馈滤波：和 mode 2 完全一样
+        VoutFF += (Vout - VoutFF) >> Vff_Shift;
+        VinFF  += (Vin  - VinFF)  >> Vff_Shift;
+
+        PI_SetLimits(&PI_I, -V_L_Max, V_L_Max);
 
         PI_I.Ref = IRef;
         PI_I.Fdb = IL;
-        Mod = PI_Calc(&PI_I);
+        V_L = PI_Calc(&PI_I);                       // 单位 V
+        Mod = _IQmpy(V_L + VoutFF, InvVin);         // 无量纲调制比
 #else
         // ---- 模式 0：正弦开环 + 软启动 ----
 #if (SFRA_ENABLE == 1)
@@ -688,6 +697,8 @@ __interrupt void ADC_ISR(void)
         IRef = 0;
         PR_Reset(&PR_V);
         PI_I.Integral = 0;
+        VoutFF += (Vout - VoutFF) >> Vff_Shift;
+        VinFF  += (Vin  - VinFF)  >> Vff_Shift;
 #endif
 #endif
 

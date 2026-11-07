@@ -92,12 +92,12 @@
 #endif
 
 // ---- 电流环 PI（LOOP_CURR_CLOSED）----
-#define KP_I                _IQ(10.0f)          // [V/A]
+#define KP_I                _IQ(5.0f)          // [V/A]  5.0
 // ★ 积分增益不再用 Q24 存"Ki 本身"，改成直接存 KiTs = Ki*Ts（也是 Q24）。
 //   原因：Q24 的 ±128 会把 Ki 卡死在 128 1/s 上不去，而 KiTs = Ki*50us 很小
 //   （Ki=10000 时也才 0.5），Q24 完全装得下。
 //   于是上限从 "Ki <= 128" 变成 "KiTs <= 128"，即 Ki <= 128/Ts = 2.56e6 1/s。
-#define KI_I              100000.0f              // [1/s] 积分增益，想给多大给多大
+#define KI_I               1.0f              // [1/s] 积分增益，想给多大给多大 1.0
 #define KI_I_Ts             _IQ(KI_I * Ts_S)  // = Ki*Ts，Q24，中断里真正用的就是它
 
 // ---- 6. 控制环参数（待整定） ----
@@ -111,14 +111,16 @@
 #define R_V             _IQ(W0_V_F * Ts_S * 0.5f)
 #define Q_V             _IQ(Wc_V_F * Ts_S * 0.5f)
 
-#define KP_V            _IQ(0.001f)    // 电压环比例
-#define KR_V            _IQ(0.00718f)    // 电压环谐振增益（=0 时退化成纯 P）0.0823
+#define KP_V            _IQ(0.01f)    // 电压环比例0.001
+#define KR_V            _IQ(1.5f)    // 电压环谐振增益（=0 时退化成纯 P）0.00718
 // ---- 电压环积分 [1/s] ----
 // ★ 不用宏切换 PI/PR，三种形态全靠取 0：
 //     KI_V = 0     -> 纯 PR（默认，行为和以前一模一样）
 //     KR_V = 0     -> 纯 PI（配 KI_V != 0）
 //     两个都给      -> PI + PR
-#define KI_V            _IQ(0.0f)
+// ★ 同样不存 Ki 本身：直接给折好采样周期的 KiTs，Ki 想多大就多大
+#define KI_V_F         0.0f                     // [1/(V·s)] 积分增益
+#define KI_V_Ts        _IQ(KI_V_F * Ts_S)       // = Ki*Ts，Q24
 // ---- 电流环 PI 的固定限幅（替代原来的"动态余量限幅"）----
 // 补偿器自己的边界给 1.0 pu of Vbus，和 TI 例程同一个比例
 //   （TI: CNTL_INV_I_3P3Z_MAX = 1.0 pu，其 pu 基准 620V -> 等于 ±620V）
@@ -143,12 +145,9 @@
 #define Vin_Ff_Max          _IQ(Vin_Ff_Max_F)
 
 // ---- 双环 PI（LOOP_DUAL）----
-// 双环那条路的 PI 输出直接当调制比用，量纲还是 mod/A，所以要单独一套，
-// 不能和上面的 V/A 混用（混了会把双环增益静默放大 60 倍）
-// ★ 这两个和 KP_I/KI_I 一样必须是 Q24 整数：KI_I3 写成裸 float 的话，
-//   KI_I3_Ts 的定标方式就跟 KI_I 不一样了（见第 6 节），两边会静默错位
-#define KP_I3               _IQ(0.0f)    // [mod/A]
-#define KI_I3               _IQ(0.0f)     // [1/s]，0 = 纯 P
+// ★ 内环现在和 LOOP_CURR_CLOSED 是同一套前馈结构：PI 输出都是电压（V），
+//   所以两个模式共用上面的 KP_I / KI_I，不再单独一套。
+//   （原来是 mod/A 的另一套，加前馈之后量纲统一了，删掉避免以后改错）
 
 // ---- 保护 ----
 // 纯软件判断，硬件保护（COMP/DAC/Digital Compare）已经删掉
@@ -230,7 +229,7 @@
 //       b) 输出降到 30Vrms：mod = 42.43/60 = 0.707，同上
 #define Mod_Max_F       0.95f
 // 开环目标调制比幅值 = Vref_Peak / Vbus = 0.8485（只给 LOOP_SINE_OPEN 用，与限幅无关）
-#define Mod_Amp_Open_F  (Vref_P eak_F / Vbus_Nominal)
+#define Mod_Amp_Open_F  (Vref_Peak_F / Vbus_Nominal)
 
 #define Vref_Peak       _IQ(Vref_Peak_F)        // Q24：50.91V -> 854156389
 #define Mod_Max         _IQ(Mod_Max_F)          // Q24：0.95
@@ -459,20 +458,18 @@
 
 
 
-// KP_I / KI_I / KP_I3 / KI_I3 的定义在顶部常改区。
-// 注意量纲：KP_I 是 mode 2（前馈结构）用的 V/A，KP_I3 是 mode 3 用的 mod/A。
-// 积分增益把采样周期折进去：KI_I_Ts = KI_I*Ts，中断里只乘一次。
-// 这样做一是快，二是保精度：Ts = 50us 在 Q24 里只有 838 个刻度
-// （0.1% 量化误差），先乘 Ts 会把误差的有效位数吃掉十几位。
+// KP_I 的定义在顶部常改区。
+// 注意量纲：mode 2 和 mode 3 现在都是前馈结构，PI 输出都是"电压"，共用 KP_I [V/A]。
 //
-// ★★ 定标必须写成下面这样，**不能**写成 _IQ(KI_I * Ts_S)：
-//   KI_I 本身已经是 Q24 整数（_IQ(1.0f) = 16777216），再乘 Ts 得到的是一位
-//   "已经乘过 2^24"的数；套上 _IQ() 等于又乘一次 2^24，直接 int32 溢出。
-//   正确做法是让浮点乘法自己完成定标：
-//     KI_IQ24 * Ts = (Ki*2^24)*Ts = KiTs_Q24   <- 正好就是要存的值
-//   KI_I = 0 时两种写法都得 0，所以这个坑一直没暴露；一加积分就会炸。
-#define KI_I_Ts         ((_iq)((float)(KI_I)  * Ts_S))
-#define KI_I3_Ts        ((_iq)((float)(KI_I3) * Ts_S))
+// ★ 不再有 KP_I3 / KI_I3 这一对：原来双环的内环是 mod/A 的另一套，
+//   加前馈之后两个模式的量纲统一了，多一套只会改错。
+//
+// ★ 也不再有 KI_I / KI_V 这种"存 Ki 本身"的宏：
+//   它们要存的是 Ki 本身，而 Ki 很容易超过 Q24 的 ±128（128 1/s 就顶了），
+//   所以现在直接定义折好采样周期的 KI_I_Ts / KI_V_Ts：
+//     KiTs = Ki*Ts      （Ki=1000 时也只是 0.05，Q24 绰绰有余）
+//   上限从 "Ki <= 128" 变成 "KiTs <= 128" => Ki <= 128/Ts = 2.56e6 1/s。
+//   中断里只做一次 _IQmpy(pi->KiTs, err)，不必每拍乘 Ts。
 
 #define Iref_Max_F      8.0f            // 电感电流给定限幅 A（IRamp 峰值 5.883A 留余量）
 #define Iref_Max        _IQ(Iref_Max_F)
