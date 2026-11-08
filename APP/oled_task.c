@@ -135,8 +135,96 @@ static void Oled_F(Uint16 x, Uint16 y, float v, Uint16 ints, Uint16 decs)
     OLED_ShowString(x, y, (u8 *)buf);
 }
 
+/*===========================================================================
+ * ★★ 临时调试视图：电流环 ★★
+ *   原来的整屏显示**原样保留**在下面的 #if 分支里，没有删。
+ *   要改回来只改这一个宏：  1 -> 0
+ *   不用逐行注释，也不会丢原来的代码。
+ *
+ * 屏 128x64，6x8 点阵 -> 16 字符 x 8 行，下面 6 行各占满 16 字符：
+ *   0) M:0.870  S:OK   调制比幅值（一个工频周期的 |Mod| 峰值）+ 保护状态
+ *   1) VO:11.6V IO:1.28A    输出电压 / 输出电流 有效值
+ *   2) IL:1.28A VL:34.9V    电感电流有效值 / |V_L| 峰值（PI 输出峰值）
+ *   3) IE:4.36A IR:2.90A    |IRef-IL| 峰值 / 有效值  ★ 跟踪精度看 IR
+ *   4) S1:  0% S2:  0%      Mod 贴限幅占比 / PI 输出被限住占比
+ *   5) VI:59.7V             母线电压（滤波后）
+ *
+ * 判读顺序（电流环调不好的时候）：
+ *   S2 大 -> PI 已经顶到 ±V_L_Max，再调增益没用，是余量/物理限制
+ *   S1 大 -> 调制比顶到 ±Mod_Max，母线/输出规格不够
+ *   IR 大而 S1/S2 都 0 -> 环路增益或相位不对（振荡），降 Kp
+ *   VL 远大于 ωL*Î（50Hz、L 已知时可算）-> PI 在打振荡而不是在推基波
+ *===========================================================================*/
+#define OLED_DEBUG_CURLOOP  0
+
 static void Oled_Draw(Uint16 fault)
 {
+#if (OLED_DEBUG_CURLOOP == 1)
+
+    // 第 0 行：调制比幅值 + 保护状态
+    OLED_ShowString(0U, 0U, (u8 *)"M:");
+    Oled_F(16U, 0U, Debug_View.ModAmp, 1U, 3U);
+
+    if (fault == FAULT_OC)
+    {
+        OLED_ShowString(72U, 0U, (u8 *)"S:OC");
+    }
+    else if (fault == FAULT_UV)
+    {
+        OLED_ShowString(72U, 0U, (u8 *)"S:UV");
+    }
+    else
+    {
+        OLED_ShowString(72U, 0U, (u8 *)"S:OK");
+    }
+
+    // 第 1 行：输出电压 / 输出电流 有效值
+    OLED_ShowString(0U, 1U, (u8 *)"VO:");
+    Oled_F(24U, 1U, Debug_View.VoutRms, 2U, 1U);
+    OLED_ShowString(64U, 1U, (u8 *)"IO:");
+    Oled_F(88U, 1U, Debug_View.IoutRms, 1U, 2U);
+
+    // 第 2 行：电感电流有效值 / |V_L| 峰值
+    OLED_ShowString(0U, 2U, (u8 *)"IL:");
+    Oled_F(24U, 2U, Debug_View.ILRms, 1U, 2U);
+    OLED_ShowString(64U, 2U, (u8 *)"VL:");
+    Oled_F(88U, 2U, Debug_Loop.V_L_Amp, 2U, 1U);
+
+    // 第 3 行：电流环跟踪误差（峰值 / 有效值）
+    OLED_ShowString(0U, 3U, (u8 *)"IE:");
+    Oled_F(24U, 3U, Debug_Loop.IErr_Amp, 1U, 2U);
+    OLED_ShowString(64U, 3U, (u8 *)"IR:");
+    Oled_F(88U, 3U, Debug_Loop.IErr_Rms, 1U, 2U);
+
+    // 第 4 行：两个饱和占比（百分比，3 位整数够到 100%）
+    OLED_ShowString(0U, 4U, (u8 *)"S1:");
+    Oled_F(24U, 4U, Debug_Loop.ModSatPct, 3U, 0U);
+    OLED_ShowString(48U, 4U, (u8 *)"%");
+    OLED_ShowString(72U, 4U, (u8 *)"S2:");
+    Oled_F(96U, 4U, Debug_Loop.PiSatPct, 3U, 0U);
+    OLED_ShowString(120U, 4U, (u8 *)"%");
+
+    // 第 5 行：母线电压（滤波后）
+    OLED_ShowString(0U, 5U, (u8 *)"VI:");
+    Oled_F(24U, 5U, Debug_Loop.VinFF, 2U, 1U);
+    OLED_ShowString(56U, 5U, (u8 *)"V");
+
+    // ---- 第 6/7 行：滤波器的**幅度**（不是瞬时值）----
+    //   VF: |VoutFF| 峰值，应 ≈ 输出电压峰值 = VO*1.414（50Hz 上 IIR 增益 0.999）
+    //       例：VO=36.0V -> VF 应该读到 50.9 左右
+    //   NF: |VinFF| 峰值，应 ≈ 母线直流值
+    //   ★ 为什么不用瞬时值：后台每 20ms 提交一次，正好一个 50Hz 周期，
+    //     瞬时快照永远落在同一相位上，看着"固定不变"是必然的，不是滤波坏了。
+    OLED_ShowString(0U, 6U, (u8 *)"VF:");
+    Oled_F(24U, 6U, Debug_Loop.VoutFF_Amp, 2U, 1U);
+    OLED_ShowString(56U, 6U, (u8 *)"V");
+
+    OLED_ShowString(0U, 7U, (u8 *)"NF:");
+    Oled_F(24U, 7U, Debug_Loop.VinFF_Amp, 2U, 1U);
+    OLED_ShowString(56U, 7U, (u8 *)"V");
+
+#else   /* ---------- 下面是原来的整屏显示，一行没删 ---------- */
+
     // 第 0 行：保护状态 + 开环/闭环（两个都很短，合在一行）
     //   S:OK  L:CLOSE  ->  保护正常、闭环
     //   S:OK  L:OPEN   ->  保护正常、开环
@@ -192,6 +280,8 @@ static void Oled_Draw(Uint16 fault)
     OLED_ShowString(0U, 7U, (u8 *)"VIN:");
     Oled_F(32U, 7U, Debug_View.Vin, 2U, 1U);
     OLED_ShowString(64U, 7U, (u8 *)"V");
+
+#endif  /* OLED_DEBUG_CURLOOP : 0 = 原来的整屏显示 */
 }
 
 /*===========================================================================

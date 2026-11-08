@@ -74,7 +74,7 @@ void PR_Reset(PR_TypeDef *p)
  * 说明：由 Kp/Kr/r/q 算出 5 个离散系数
  *       初始化时调用一次，之后中断里只跑 PR_Calc
  *===========================================================================*/
-void PR_Design(PR_TypeDef *p, _iq Kp, _iq Kr, _iq Ki, _iq r, _iq q)
+void PR_Design(PR_TypeDef *p, _iq Kp, _iq Kr, _iq KiTs, _iq r, _iq q)
 {
     _iq r2;
     _iq d0p, d1p, d2p;
@@ -82,12 +82,7 @@ void PR_Design(PR_TypeDef *p, _iq Kp, _iq Kr, _iq Ki, _iq r, _iq q)
 
     p->Kp = Kp;
     p->Kr = Kr;
-    p->Ki = Ki;
-
-    // KiTs = Ki*Ts。★ Ki 本身就是 Q24 整数，让浮点乘法自己完成定标：
-    //   (Ki*2^24)*Ts 正好就是 Ki*Ts 的 Q24 —— 和 dcac_cfg.h 的 KI_I_Ts 同一写法。
-    //   写成 _IQ(Ki * Ts_S) 会再乘一次 2^24，直接 int32 溢出。
-    p->KiTs = (_iq)((float)Ki * Ts_S);
+    p->KiTs = KiTs;         // 调用方已经在 dcac_cfg.h 里折成 Ki*Ts（Q24）
     p->Integral = 0;
 
     // 无量纲小量 r、q 由调用者按 Q24 传进来

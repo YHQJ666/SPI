@@ -49,8 +49,10 @@ typedef struct
     // 设计输入
     _iq Kp;           // 比例增益
     _iq Kr;           // 谐振增益（=0 时谐振支路退化成纯增益 Kp，即纯 P）
-    _iq Ki;           // 积分增益 [1/s]（=0 时不加积分，即纯 PR）
     _iq KiTs;         // = Ki*Ts，已经折好，中断里只乘一次
+                      // ★ 这里不存 Ki 本身：Ki 很容易超过 Q24 的 ±128
+                      //   （比如 Ki=1000 1/s 就存不下），但 KiTs=Ki*50us 很小。
+                      //   调用方在 dcac_cfg.h 里用裸 float 的 KI_V_F 折好再传进来
 
     // Tustin 离散系数（a0 归一化为 1），Q24
     // w0、wc、Ts 在 PR_Design 之前就已经合成 r = w0*Ts/2、q = wc*Ts/2，
@@ -81,8 +83,9 @@ extern PR_TypeDef PR_V;     // 电压外环
 // 按 Tustin 法计算 b0/b1/b2/a1/a2，并把 Ki 折成 KiTs
 //   r = w0*Ts/2, q = wc*Ts/2，都是 Q24（w0 超出 Q24 范围，
 //   已经在 dcac_cfg.h 里折成 r、q，不会再出现 314 这种数）
-//   ★ Ki 传 0 就是不加积分（纯 PR）；Kr 传 0 就是纯 P（退化后正好是 Kp）
-void PR_Design(PR_TypeDef *p, _iq Kp, _iq Kr, _iq Ki, _iq r, _iq q);
+//   ★ KiTs 传 0 就是不加积分（纯 PR）；Kr 传 0 就是纯 P（退化后正好是 Kp）
+//   ★ 直接收 KiTs（= Ki*Ts）而不是 Ki：Ki 本身可能超 Q24 的 ±128，KiTs 不会
+void PR_Design(PR_TypeDef *p, _iq Kp, _iq Kr, _iq KiTs, _iq r, _iq q);
 
 // 清掉全部历史：谐振腔 + 误差历史 + 积分
 // 上电、清故障、切模式时一行搞定，不会漏掉新加的状态

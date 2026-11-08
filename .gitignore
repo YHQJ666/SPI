@@ -5,6 +5,7 @@ Debug/
 Release/
 *.launch
 
+
 # 编译生成的二进制文件和中间文件
 *.out
 *.map
@@ -19,3 +20,6 @@ Thumbs.db
 Desktop.ini
 .vscode/
 .idea/
+
+#扫频数据
+docs/

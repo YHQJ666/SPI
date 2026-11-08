@@ -43,6 +43,8 @@ static volatile _iq FiltMod  = 0;
 // ---- 电流环健康度累加器（每 20ms 清零一次）----
 static volatile _iq    VLPeak   = 0;
 static volatile _iq    IErrPeak = 0;
+static volatile _iq    VFFPeak  = 0;   // |VoutFF| 峰值（查滤波器幅度）
+static volatile _iq    NFFPeak  = 0;   // |VinFF|  峰值
 static volatile long long IErrSq = 0;
 static volatile Uint16 ModSatCnt = 0U;
 static volatile Uint16 PiSatCnt  = 0U;
@@ -54,6 +56,10 @@ extern volatile _iq V_L;
 extern volatile _iq Mod;
 extern PI_TypeDef  PI_I;
 extern volatile _iq VinFF;
+// 滤波前后对照用：原始值和滤波值都取同一拍的快照
+extern volatile _iq Vout;
+extern volatile _iq VoutFF;
+extern volatile _iq Vin;
 
 // 校零实测到的引脚电压（V），只给 OLED 显示 Z: 用
 static float CalPinVout = 0.0f;
@@ -228,6 +234,35 @@ void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
 }
 
 /*===========================================================================
+ * 函数名：Debug_View_IsrFf
+ * 说明：VoutFF / VinFF 的峰值保持。必须在电流环分支里、前馈 IIR 更新之后调用。
+ *       只做取绝对值和比较，没有乘法，20kHz 里开销可以忽略。
+ *       判据：|VoutFF| 峰值应 ≈ Vout 峰值（50Hz 上 IIR 增益 0.999），
+ *             |VinFF|  峰值应 ≈ 母线直流值。
+ *===========================================================================*/
+void Debug_View_IsrFf(_iq voutff, _iq vinff)
+{
+#if (SFRA_ENABLE == 0)
+    _iq a;
+
+    a = (voutff >= 0) ? voutff : -voutff;
+    if (a > VFFPeak)
+    {
+        VFFPeak = a;
+    }
+
+    a = (vinff >= 0) ? vinff : -vinff;
+    if (a > NFFPeak)
+    {
+        NFFPeak = a;
+    }
+#else
+    (void)voutff;
+    (void)vinff;
+#endif
+}
+
+/*===========================================================================
  * 函数名：Debug_View_ScopeSample
  * 说明：示波器缓冲抽样。内部自带抽取计数，Scope_Prescale 防 0。
  *       功能没打开时是空函数，编译器直接内联掉。
@@ -319,8 +354,21 @@ void Debug_View_Background(void)
     Debug_Loop.PiSatPct  = (float)PiSatCnt  * 100.0f / (float)Rms_Cycle_Samples;
     Debug_Loop.VinFF     = _IQtoF(VinFF);
 
+    // ---- 滤波前后对照 ----
+    // ★ 判据用**幅度**：20ms 提交一次正好是一个 50Hz 周期，瞬时值永远落在
+    //   同一个相位上，看着"固定不变"是必然的，不是滤波坏了。
+    //   |VoutFF| 峰值应 ≈ Vout 峰值（= VoutRms*1.414）；|VinFF| 峰值应 ≈ 母线直流
+    Debug_Loop.VoutFF_Amp = _IQtoF(VFFPeak);
+    Debug_Loop.VinFF_Amp  = _IQtoF(NFFPeak);
+    // 下面三个只做瞬时快照，Expressions 里看，不上屏
+    Debug_Loop.Vout      = _IQtoF(Vout);
+    Debug_Loop.VoutFF    = _IQtoF(VoutFF);
+    Debug_Loop.Vin       = _IQtoF(Vin);
+
     VLPeak    = 0;
     IErrPeak  = 0;
+    VFFPeak   = 0;
+    NFFPeak   = 0;
     ModSatCnt = 0U;
     PiSatCnt  = 0U;
 

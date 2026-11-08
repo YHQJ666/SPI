@@ -76,7 +76,7 @@
 #define LOOP_DUAL         3
 
 #ifndef LOOP_MODE
-#define LOOP_MODE         2
+#define LOOP_MODE         3
 #endif
 
 // ---- 功能开关 ----
@@ -97,8 +97,8 @@
 //   原因：Q24 的 ±128 会把 Ki 卡死在 128 1/s 上不去，而 KiTs = Ki*50us 很小
 //   （Ki=10000 时也才 0.5），Q24 完全装得下。
 //   于是上限从 "Ki <= 128" 变成 "KiTs <= 128"，即 Ki <= 128/Ts = 2.56e6 1/s。
-#define KI_I               1.0f              // [1/s] 积分增益，想给多大给多大 1.0
-#define KI_I_Ts             _IQ(KI_I * Ts_S)  // = Ki*Ts，Q24，中断里真正用的就是它
+#define KI_I               1.0f              // [1/s]
+#define KI_I_Ts             _IQ(KI_I * Ts_S)  // = Ki*Ts
 
 // ---- 6. 控制环参数（待整定） ----
 #define W0_V_F          314.159265f     // 电压环 2*pi*50 谐振角频率
@@ -111,8 +111,8 @@
 #define R_V             _IQ(W0_V_F * Ts_S * 0.5f)
 #define Q_V             _IQ(Wc_V_F * Ts_S * 0.5f)
 
-#define KP_V            _IQ(0.01f)    // 电压环比例0.001
-#define KR_V            _IQ(1.5f)    // 电压环谐振增益（=0 时退化成纯 P）0.00718
+#define KP_V            _IQ(0.1f)    // 电压环比例0.01
+#define KR_V            _IQ(1.55f)    // 电压环谐振增益（=0 时退化成纯 P）1.5
 // ---- 电压环积分 [1/s] ----
 // ★ 不用宏切换 PI/PR，三种形态全靠取 0：
 //     KI_V = 0     -> 纯 PR（默认，行为和以前一模一样）

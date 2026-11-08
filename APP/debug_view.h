@@ -61,6 +61,16 @@ typedef struct
     float ModSatPct;    // |Mod| >= Mod_Max 的采样点占比，% —— 调制比贴限幅的程度
     float PiSatPct;     // PI 输出被 OutMax/OutMin 限住的占比，% —— 余量耗尽的程度
     float VinFF;        // 滤波后的母线电压，V（InvVin 就是它的倒数）
+    // ---- 滤波前后对照（查一阶 IIR 是否正常）----
+    // ★ 判据是**幅度**，不是瞬时值：20ms 提交一次 = 正好一个 50Hz 周期，
+    //   瞬时值永远落在同一个相位上，所以看着"固定不变"是必然的。
+    //   VoutFF 的峰值应该 ≈ Vout 的峰值 = VoutRms*1.414（50Hz 上增益 0.999）
+    float VoutFF_Amp;   // |VoutFF| 峰值，V   ← 应 ≈ VoutAmp
+    float VinFF_Amp;    // |VinFF| 峰值，V    ← 应 ≈ 母线直流值
+    // 下面三个只是瞬时快照（Expressions 里看，不上屏）
+    float Vout;         // 输出电压瞬时值（未滤波），V
+    float VoutFF;       // 输出电压前馈（滤波后）瞬时值，V
+    float Vin;          // 母线瞬时值（未滤波），V
 } Debug_Loop_Type;
 
 extern volatile Debug_Loop_Type Debug_Loop;
@@ -79,6 +89,11 @@ void Debug_View_IsrUpdate(_iq vout, _iq iout, _iq il, _iq vin, _iq iin, _iq mod)
 
 // ADC 中断里每拍调用：示波器缓冲抽样（内部自带抽取计数和防 0）
 void Debug_View_ScopeSample(_iq iout, _iq il);
+
+// ADC 中断里每拍调用（**只在前馈更新之后**）：VoutFF / VinFF 的峰值保持
+// 为什么单独一个函数：VoutFF 是在电流环分支里、Debug_View_IsrUpdate 之后才更新的，
+// 想拿到"本周期的滤波结果"就必须在这里再取一次峰值
+void Debug_View_IsrFf(_iq voutff, _iq vinff);
 
 // 后台调用：每满一个工频周期算一次有效值、平滑、刷新 Debug_View
 void Debug_View_Background(void);
